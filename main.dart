@@ -431,7 +431,7 @@ class _AdminShellState extends State<AdminShell> {
     'Users & KYC','Reports & Audit'];
   static const icons=[Icons.dashboard,Icons.payments,Icons.outbox,Icons.people,
     Icons.savings,Icons.currency_exchange,Icons.verified,Icons.receipt_long,
-    Icons.payroll,Icons.manage_accounts,Icons.badge,Icons.analytics];
+    Icons.payments_outlined,Icons.manage_accounts,Icons.badge,Icons.analytics];
   @override Widget build(BuildContext context) {
     final pages=<Widget>[
       AdminOverview(onSelect:(x)=>setState(()=>selected=x)),const AdminDeposits(),
@@ -718,16 +718,16 @@ class AdminStaff extends StatelessWidget {
       else StatusBadge(entry.value['active']==true?'Active':'Disabled'),
     ])))),
   ]));
-  void add(BuildContext ctx){
+  void add(BuildContext parentContext){
     final name=TextEditingController();String role=roles.first;
-    showDialog<void>(context:ctx,builder:(ctx)=>StatefulBuilder(builder:(ctx,upd)=>AlertDialog(
+    showDialog<void>(context:parentContext,builder:(ctx)=>StatefulBuilder(builder:(ctx,upd)=>AlertDialog(
       title:const Text('Add Demo Staff'),content:Column(mainAxisSize:MainAxisSize.min,children:[
         FormLine(controller:name,label:'Staff Name'),
         DropdownButtonFormField<String>(value:role,items:roles.map((x)=>DropdownMenuItem(value:x,child:Text(x))).toList(),
           onChanged:(v)=>upd(()=>role=v??role),decoration:const InputDecoration(labelText:'Role'))]),
       actions:[TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),
         FilledButton(onPressed:(){final err=data.addStaff(name.text,role);if(err==null)Navigator.pop(ctx);
-          snack(context,err??'Staff entry created',err!=null);},child:const Text('Add'))])));
+          if(parentContext.mounted) snack(parentContext,err??'Staff entry created',err!=null);},child:const Text('Add'))])));
   }
 }
 
