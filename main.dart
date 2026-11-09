@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -345,6 +348,7 @@ class MorePage extends StatelessWidget {
     moreTile(context,Icons.person_outline,'Profile',const ProfilePage()),
     moreTile(context,Icons.support_agent,'Help & Support',const SupportPage()),
     moreTile(context,Icons.notifications_outlined,'Notifications',const NotificationsPage()),
+    moreTile(context,Icons.cloud_outlined,'API & D1 Connection',const ApiConnectionPage()),
     const SizedBox(height:15),OutlinedButton.icon(onPressed:onLogout,
       icon:const Icon(Icons.logout),label:Text(t('واپس جائیں','Back to Demo Login'))),
   ]));
@@ -419,6 +423,202 @@ class NotificationsPage extends StatelessWidget {
     ])))]));
 }
 
+
+class ApiConnectionPage extends StatefulWidget {
+  const ApiConnectionPage({super.key});
+
+  @override
+  State<ApiConnectionPage> createState() => _ApiConnectionPageState();
+}
+
+class _ApiConnectionPageState extends State<ApiConnectionPage> {
+  static final Uri healthUrl = Uri.parse(
+    'https://sarmaya-plus-api.bismurahved-819.workers.dev/health',
+  );
+
+  bool loading = false;
+  String? errorMessage;
+  Map<String, dynamic>? result;
+
+  @override
+  void initState() {
+    super.initState();
+    checkConnection();
+  }
+
+  Future<void> checkConnection() async {
+    if (loading) return;
+    setState(() {
+      loading = true;
+      errorMessage = null;
+      result = null;
+    });
+
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 10);
+    try {
+      final request = await client
+          .getUrl(healthUrl)
+          .timeout(const Duration(seconds: 12));
+      request.headers.set(HttpHeaders.acceptHeader, 'application/json');
+      final response = await request
+          .close()
+          .timeout(const Duration(seconds: 12));
+      final responseText = await utf8.decoder
+          .bind(response)
+          .join()
+          .timeout(const Duration(seconds: 12));
+
+      if (response.statusCode != HttpStatus.ok) {
+        throw Exception('HTTP ${response.statusCode}');
+      }
+
+      final parsed = jsonDecode(responseText);
+      if (parsed is! Map<String, dynamic>) {
+        throw const FormatException('Unexpected API response');
+      }
+
+      if (!mounted) return;
+      setState(() => result = parsed);
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => errorMessage = error.toString());
+    } finally {
+      client.close(force: true);
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final response = result;
+    final connected = response?['success'] == true &&
+        response?['database'] == 'Connected' &&
+        response?['schema_complete'] == true &&
+        response?['total_tables'] == 29;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(t('API کنکشن ٹیسٹ', 'API Connection Test')),
+      ),
+      body: Column(
+        children: [
+          const DemoNotice(),
+          Expanded(
+            child: ScreenPad(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  TitleLine(
+                    t('Cloudflare D1 کنکشن', 'Cloudflare D1 Connection'),
+                  ),
+                  if (loading) const LinearProgressIndicator(),
+                  if (errorMessage != null)
+                    Block(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Icon(
+                            Icons.cloud_off_outlined,
+                            color: Colors.red,
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            t('کنکشن ناکام ہوا', 'Connection failed'),
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            errorMessage!,
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                  if (response != null)
+                    Block(
+                      child: Column(
+                        children: [
+                          Icon(
+                            connected
+                                ? Icons.cloud_done_outlined
+                                : Icons.warning_amber,
+                            color: connected ? Colors.green : Colors.orange,
+                            size: 44,
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            connected
+                                ? t('کنکشن کامیاب', 'Connection successful')
+                                : t(
+                                    'ڈیٹابیس کی جانچ مکمل نہیں ہوئی',
+                                    'Database check incomplete',
+                                  ),
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 17,
+                            ),
+                          ),
+                          const SizedBox(height: 12),
+                          valueRow('API', '${response['api'] ?? 'Unknown'}'),
+                          valueRow(
+                            'Database',
+                            '${response['database'] ?? 'Unknown'}',
+                          ),
+                          valueRow(
+                            'Tables',
+                            '${response['total_tables'] ?? '-'} / 29',
+                          ),
+                          valueRow('Mode', '${response['mode'] ?? 'Unknown'}'),
+                          valueRow(
+                            'Financial transactions enabled',
+                            response['financial_transactions_enabled'] == true
+                                ? 'Yes'
+                                : 'No',
+                          ),
+                        ],
+                      ),
+                    ),
+                  const SizedBox(height: 12),
+                  FilledButton.icon(
+                    onPressed: loading ? null : checkConnection,
+                    icon: const Icon(Icons.refresh),
+                    label: Text(
+                      t('دوبارہ چیک کریں', 'Test Connection Again'),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  OutlinedButton.icon(
+                    onPressed: () => launchUrl(
+                      healthUrl,
+                      mode: LaunchMode.externalApplication,
+                    ),
+                    icon: const Icon(Icons.open_in_browser),
+                    label: Text(
+                      t('براؤزر میں کھولیں', 'Open Health URL in Browser'),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  Block(
+                    child: Text(
+                      t(
+                        'یہ صرف سرور اور 29 ٹیبلز کا Read-only ٹیسٹ ہے۔ Wallet، Investor اور Admin کا ڈیٹا اب بھی صرف اس فون کے Demo میں محفوظ ہوتا ہے۔ یہ حقیقی لاگ اِن یا رقم کا نظام نہیں ہے۔',
+                        'This is a read-only server and 29-table connection test. Wallet, investor and admin records still use local demo storage on this phone. This is not a live login or real-money service.',
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class AdminShell extends StatefulWidget {
   const AdminShell({super.key,required this.onLogout});
   final VoidCallback onLogout;
@@ -440,7 +640,9 @@ class _AdminShellState extends State<AdminShell> {
       const AdminPayroll(),const AdminStaff(),const AdminUsers(),const AdminReports()];
     return Scaffold(appBar:AppBar(title:Text('Admin • ${labels[selected]}',
       style:const TextStyle(fontWeight:FontWeight.bold,fontSize:19)),
-      actions:[IconButton(onPressed:()=>data.setLanguage(!data.urdu),icon:const Icon(Icons.language))]),
+      actions:[IconButton(tooltip:'API Connection',
+        onPressed:()=>go(context,const ApiConnectionPage()),icon:const Icon(Icons.cloud_outlined)),
+        IconButton(onPressed:()=>data.setLanguage(!data.urdu),icon:const Icon(Icons.language))]),
       drawer:Drawer(child:SafeArea(child:Column(children:[
         Container(width:double.infinity,color:green,padding:const EdgeInsets.all(20),
           child:Column(crossAxisAlignment:CrossAxisAlignment.start,children:[
