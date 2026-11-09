@@ -1,4 +1,3 @@
-
 name: Build Sarmaya Plus APK
 
 on:
@@ -10,7 +9,6 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
 
@@ -28,49 +26,125 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
 
-      - name: Prepare Flutter project folders
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Prepare Flutter files
         run: |
-          mkdir -p lib
-          mkdir -p assets
-
-          if [ -f main.dart ]; then
-            mv main.dart lib/main.dart
-          fi
-
-          if [ -f store.dart ]; then
-            mv store.dart lib/store.dart
-          fi
-
-          if [ -f sarmaya_icon.png ]; then
-            cp sarmaya_icon.png assets/sarmaya_icon.png
-          fi
-
+          mkdir -p lib assets
+          mv main.dart lib/main.dart
+          mv store.dart lib/store.dart
+          cp sarmaya_icon.png assets/sarmaya_icon.png
+          test -f lib/auth_entry.dart
           test -f lib/main.dart
-          test -f lib/store.dart
-          test -f assets/sarmaya_icon.png
 
       - name: Generate Android project
-        run: |
-          flutter create \
-            --platforms=android \
-            --project-name=sarmaya_plus \
-            --org=pk.sarmayaplus \
-            .
+        run: flutter create --platforms=android --project-name=sarmaya_plus --org=pk.sarmayaplus .
 
-      - name: Set application name
+      - name: Configure Firebase securely
+        env:
+          FIREBASE_JSON: ${{ secrets.FIREBASE_GOOGLE_SERVICES_JSON }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          raw = os.environ.get('FIREBASE_JSON', '')
+          if not raw:
+              raise RuntimeError('Missing FIREBASE_GOOGLE_SERVICES_JSON repository secret')
+
+          config = json.loads(raw)
+          package = 'pk.sarmayaplus.sarmaya_plus'
+          client = next((c for c in config['client']
+                         if c['client_info']['android_client_info']['package_name'] == package), None)
+          if client is None:
+              raise RuntimeError('Firebase Android package name does not match this app')
+
+          project = config['project_info']
+          if project['project_id'] != 'sarmaya-plus':
+              raise RuntimeError('Unexpected Firebase project ID')
+
+          app_id = client['client_info']['mobilesdk_app_id']
+          api_key = client['api_key'][0]['current_key']
+          sender_id = project['project_number']
+          bucket = project.get('storage_bucket', '')
+          q = json.dumps
+
+          firebase_options = (
+              "import 'package:firebase_core/firebase_core.dart';\n"
+              "import 'package:flutter/foundation.dart' "
+              "show defaultTargetPlatform, TargetPlatform, kIsWeb;\n\n"
+              'class DefaultFirebaseOptions {\n'
+              '  static FirebaseOptions get currentPlatform {\n'
+              '    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {\n'
+              '      return android;\n'
+              '    }\n'
+              "    throw UnsupportedError('Sarmaya Plus demo supports Android only');\n"
+              '  }\n\n'
+              '  static const FirebaseOptions android = FirebaseOptions(\n'
+              f'    apiKey: {q(api_key)},\n'
+              f'    appId: {q(app_id)},\n'
+              f'    messagingSenderId: {q(sender_id)},\n'
+              f'    projectId: {q(project["project_id"])},\n'
+              f'    storageBucket: {q(bucket)},\n'
+              '  );\n'
+              '}\n'
+          )
+          Path('lib/firebase_options.dart').write_text(firebase_options, encoding='utf-8')
+          Path('android/app/google-services.json').write_text(json.dumps(config), encoding='utf-8')
+
+          settings = Path('android/settings.gradle.kts')
+          app = Path('android/app/build.gradle.kts')
+          if not settings.exists() or not app.exists():
+              raise RuntimeError('Expected Kotlin Gradle files not generated')
+
+          settings_text = settings.read_text()
+          settings_needle = 'id("com.android.application")'
+          if settings_needle not in settings_text:
+              raise RuntimeError('Android application Gradle plugin not found in settings')
+          settings_text = settings_text.replace(
+              settings_needle,
+              'id("com.google.gms.google-services") version "4.4.4" apply false\n    ' + settings_needle,
+              1,
+          )
+          settings.write_text(settings_text)
+
+          app_text = app.read_text()
+          if settings_needle not in app_text:
+              raise RuntimeError('Android application Gradle plugin not found in app')
+          app_text = app_text.replace(
+              settings_needle,
+              settings_needle + '\n    id("com.google.gms.google-services")',
+              1,
+          )
+          app_text = app_text.replace('minSdk = flutter.minSdkVersion', 'minSdk = 24')
+          app.write_text(app_text)
+          print('Firebase configuration generated for Android (no secrets printed)')
+          PY
+
+      - name: Set Android app name
         run: |
           sed -i 's/android:label="sarmaya_plus"/android:label="Sarmaya Plus"/' android/app/src/main/AndroidManifest.xml
 
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Build Android APK
-        run: flutter build apk --debug
+      - name: Build Firebase Login APK
+        run: flutter build apk --debug --target-platform android-arm64 -t lib/auth_entry.dart
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Sarmaya-Plus-APK
+          name: Sarmaya-Plus-Android-Account-APK
           path: build/app/outputs/flutter-apk/app-debug.apk
           retention-days: 7
