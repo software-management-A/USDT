@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'firebase_options.dart';
 
-// Sarmaya Plus — Account Dashboard v1
+// Sarmaya Plus — Account Dashboard v2: secure profile name edit
 // Firebase Email/Password + verified Cloudflare /v1/me profile.
 // No deposits, withdrawals, trading, investment or KYC document submission.
 const Color deepGreen = Color(0xFF123F2B);
@@ -400,6 +400,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
   int tab = 0;
   bool loading = true;
   bool sendingEmail = false;
+  bool savingProfile = false;
   bool hideEmail = false;
   final List<bool> readyChecklist = [false, false, false];
   String? error;
@@ -498,6 +499,81 @@ class _AccountHomePageState extends State<AccountHomePage> {
       if (mounted) setState(() => error = e.toString());
     } finally {
       if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> _editName() async {
+    if (profile == null || savingProfile || loading) return;
+    String candidate = cloudName;
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Edit name / نام تبدیل کریں'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextFormField(
+              initialValue: cloudName,
+              onChanged: (value) => candidate = value,
+              maxLength: 100,
+              maxLines: 1,
+              textCapitalization: TextCapitalization.words,
+              keyboardType: TextInputType.name,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: 'Full name / مکمل نام'),
+            ),
+            const Text(
+              'Only your display name can be changed. Your email, KYC status and account ID stay protected.',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, candidate),
+            child: const Text('Save name'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || newName == null) return;
+    final name = newName.trim().replaceAll(RegExp(r'\s+'), ' ');
+    if (name.runes.length < 2 || name.runes.length > 100 ||
+        RegExp(r'[\x00-\x1f\x7f]').hasMatch(name)) {
+      _snack('Enter a name between 2 and 100 characters.');
+      return;
+    }
+    if (name == cloudName) return;
+    setState(() => savingProfile = true);
+    try {
+      final response = await authenticatedRequest('PATCH', '/v1/me', {
+        'display_name': name,
+      });
+      final updated = response['profile'];
+      if (updated is! Map<String, dynamic> || updated['display_name'] != name) {
+        throw Exception('Server did not confirm the updated name.');
+      }
+      if (!mounted) return;
+      setState(() {
+        profile = updated;
+        error = null;
+        lastSynced = DateTime.now();
+      });
+      // The D1 profile is authoritative; a Firebase display-name sync failure
+      // must not undo a correctly saved Cloudflare profile.
+      try {
+        await widget.user.updateDisplayName(name);
+      } catch (_) { /* A future sign-in will still load the cloud profile. */ }
+      _snack('Name updated successfully in your cloud account.');
+    } catch (e) {
+      _snack('Name not updated: $e');
+    } finally {
+      if (mounted) setState(() => savingProfile = false);
     }
   }
 
@@ -753,6 +829,19 @@ class _AccountHomePageState extends State<AccountHomePage> {
             const Text('Verified email account', style: TextStyle(color: Colors.black54)),
             const Divider(height: 28),
             _infoRow('Full name / نام', cloudName, icon: Icons.person_outline),
+            const SizedBox(height: 6),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: savingProfile || loading || profile == null ? null : _editName,
+                icon: savingProfile
+                    ? const SizedBox(width: 18, height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                    : const Icon(Icons.edit_outlined),
+                label: Text(savingProfile ? 'Saving...' : 'Edit name / نام تبدیل کریں'),
+              ),
+            ),
+            const Divider(height: 28),
             _infoRow('Email / ای میل', shownEmail, icon: Icons.email_outlined),
             _infoRow('Email verification', 'Verified', icon: Icons.verified_outlined),
             _infoRow('Account status', statusName, icon: Icons.fact_check_outlined),
@@ -769,7 +858,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
-            'For your protection, your Firebase email and cloud registration details cannot be edited on this screen. Account changes need a secure, authenticated server endpoint.',
+            'You can securely update your name in Cloudflare. Email, account status, KYC, registration/referral records and account ID cannot be changed here.',
             style: TextStyle(fontSize: 12),
           ),
         )),
@@ -873,7 +962,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
-            'Sarmaya Plus • Account Dashboard v1\n'
+            'Sarmaya Plus • Account Dashboard v2\n'
             'Login: Firebase Authentication\n'
             'Account profile: Cloudflare API + D1\n'
             'KYC checklist and email-hide setting: stored on this device only\n\n'
