@@ -9,7 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'firebase_options.dart';
 
-// Sarmaya Plus — Account Dashboard v2: secure profile name edit
+// Sarmaya Plus — Account Dashboard v3: profile edit + KYC review request
 // Firebase Email/Password + verified Cloudflare /v1/me profile.
 // No deposits, withdrawals, trading, investment or KYC document submission.
 const Color deepGreen = Color(0xFF123F2B);
@@ -402,6 +402,10 @@ class _AccountHomePageState extends State<AccountHomePage> {
   bool sendingEmail = false;
   bool savingProfile = false;
   bool hideEmail = false;
+  bool kycSubmitting = false;
+  bool kycAcknowledged = false;
+  String? kycError;
+  Map<String, dynamic>? kycRequest;
   final List<bool> readyChecklist = [false, false, false];
   String? error;
   Map<String, dynamic>? profile;
@@ -495,6 +499,18 @@ class _AccountHomePageState extends State<AccountHomePage> {
         if (profile == null) error = 'No cloud profile found for this account.';
         lastSynced = DateTime.now();
       });
+      // Keep the successful profile visible if the new KYC endpoint is unavailable.
+      try {
+        final kyc = await authenticatedRequest('GET', '/v1/kyc-request');
+        if (mounted) setState(() {
+          kycRequest = kyc['request'] is Map<String, dynamic>
+              ? kyc['request'] as Map<String, dynamic>
+              : null;
+          kycError = null;
+        });
+      } catch (e) {
+        if (mounted) setState(() => kycError = 'KYC request sync unavailable: $e');
+      }
     } catch (e) {
       if (mounted) setState(() => error = e.toString());
     } finally {
@@ -574,6 +590,32 @@ class _AccountHomePageState extends State<AccountHomePage> {
       _snack('Name not updated: $e');
     } finally {
       if (mounted) setState(() => savingProfile = false);
+    }
+  }
+
+  Future<void> _submitKycRequest() async {
+    if (kycSubmitting || profile == null || kycRequest != null ||
+        cloudStatus != 'pending_kyc' || !kycAcknowledged) return;
+    setState(() { kycSubmitting = true; kycError = null; });
+    try {
+      final response = await authenticatedRequest('POST', '/v1/kyc-request', {
+        'acknowledged': true,
+        'version': 'kyc-request-2026-11',
+      });
+      final received = response['request'];
+      if (received is! Map<String, dynamic>) {
+        throw Exception('Server did not confirm your request.');
+      }
+      if (!mounted) return;
+      setState(() {
+        kycRequest = received;
+        kycAcknowledged = false;
+      });
+      _snack('KYC review request received. Your identity is NOT yet verified.');
+    } catch (e) {
+      if (mounted) setState(() => kycError = 'Request not submitted: $e');
+    } finally {
+      if (mounted) setState(() => kycSubmitting = false);
     }
   }
 
@@ -874,10 +916,58 @@ class _AccountHomePageState extends State<AccountHomePage> {
             Icon(Icons.info_outline, color: deepGreen),
             SizedBox(width: 12),
             Expanded(child: Text(
-              'KYC applications and identity document uploads are not open yet. No CNIC, passport, photos or other identity documents are collected in this version.',
+              'You can request a future identity review. This does NOT verify your identity or approve your account. Do not enter or upload CNIC, passport, birth date, photos or other identity documents.',
             )),
           ]),
         )),
+        _sectionHeading('Request a KYC review / درخواست'),
+        if (kycError != null) Card(child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(kycError!, style: const TextStyle(color: Colors.red)),
+        )),
+        if (kycRequest != null) Card(
+          color: paleGreen,
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Your request was received / درخواست موصول ہوگئی',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+              const SizedBox(height: 9),
+              Text('Request status: ${kycRequest!['status'] ?? 'submitted'}'),
+              const SizedBox(height: 5),
+              Text('Submitted (UTC): ${kycRequest!['created_at'] ?? 'Unknown'}'),
+              const SizedBox(height: 10),
+              const Text('This is a review request only. KYC remains pending until a separate authorized verification process is completed.',
+                style: TextStyle(fontSize: 12)),
+            ]),
+          ),
+        ),
+        if (kycRequest == null && profile != null && cloudStatus == 'pending_kyc')
+          Card(child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Request to join the identity review queue',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+              const SizedBox(height: 8),
+              const Text('Only your existing Cloudflare account ID is used. No identity documents or ID numbers are requested.'),
+              CheckboxListTile(
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                title: const Text('I understand this does not verify my identity or enable financial services.'),
+                value: kycAcknowledged,
+                onChanged: kycSubmitting ? null
+                    : (value) => setState(() => kycAcknowledged = value ?? false),
+              ),
+              SizedBox(width: double.infinity, child: FilledButton.icon(
+                onPressed: kycAcknowledged && !kycSubmitting ? _submitKycRequest : null,
+                icon: kycSubmitting
+                  ? const SizedBox(width: 18, height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                  : const Icon(Icons.send_outlined),
+                label: Text(kycSubmitting ? 'Submitting...' : 'Submit review request / درخواست بھیجیں'),
+              )),
+            ]),
+          )),
         _sectionHeading('Preparation checklist / تیاری'),
         Card(child: Column(children: [
           CheckboxListTile(
@@ -962,11 +1052,11 @@ class _AccountHomePageState extends State<AccountHomePage> {
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
-            'Sarmaya Plus • Account Dashboard v2\n'
+            'Sarmaya Plus • Account Dashboard v3\n'
             'Login: Firebase Authentication\n'
             'Account profile: Cloudflare API + D1\n'
             'KYC checklist and email-hide setting: stored on this device only\n\n'
-            'Financial features and KYC document submission are disabled pending security, verified procedures and applicable authorization.',
+            'KYC review requests store only the requesting account ID and status in Cloudflare. Identity document uploads and financial services remain disabled.',
           ),
         )),
       ];
