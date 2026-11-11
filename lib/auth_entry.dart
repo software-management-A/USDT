@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'firebase_options.dart';
+import 'remittance_v10.dart';
 
 // Only the authenticated Cloudflare backend grants admin access.
 typedef ApiRequest = Future<Map<String, dynamic>> Function(
@@ -414,6 +415,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
   bool personalEnabled = false;
   bool unifiedOwner = false;
   String unifiedMode = 'PERSONAL';
+  String? v9StaffRole;
   Map<String, dynamic> personalSummary = {};
   String? kycError;
   Map<String, dynamic>? kycRequest;
@@ -544,6 +546,12 @@ class _AccountHomePageState extends State<AccountHomePage> {
       } catch (_) {
         if (mounted) setState(() { personalEnabled = false; personalSummary = {}; });
       }
+      // Remittance roles come from a signed, D1-authorized backend response.
+      try {
+        final v9Access = await authenticatedRequest('GET', '/v1/remit/access');
+        if (mounted) setState(() => v9StaffRole = v9Access['staff'] == true
+            ? v9Access['role']?.toString() : null);
+      } catch (_) { if (mounted) setState(() => v9StaffRole = null); }
       // Ordinary accounts get no Admin button. A verified UID alone is insufficient.
       try {
         final access = await authenticatedRequest('GET', '/v1/admin/overview');
@@ -851,6 +859,28 @@ class _AccountHomePageState extends State<AccountHomePage> {
     if (mounted) refreshProfile();
   }
 
+  Future<void> _openTransferCustomer() async {
+    await Navigator.push(context, MaterialPageRoute(
+      builder: (_) => TransferCustomerPage(request: authenticatedRequest),
+    ));
+    if (mounted) refreshProfile();
+  }
+
+  Future<void> _openTransferAdmin() async {
+    await Navigator.push(context, MaterialPageRoute(
+      builder: (_) => TransferAdminPage(
+        request: authenticatedRequest, owner: unifiedOwner,
+        openInvestors: _openUnified,
+        openPersonal: _openPersonal,
+        openMode: _openModeControl,
+        openKyc: () => Navigator.push(context, MaterialPageRoute(
+          builder: (_) => AdminConsolePage(request: authenticatedRequest),
+        )),
+      ),
+    ));
+    if (mounted) refreshProfile();
+  }
+
   List<Widget> _homeWidgets() => [
         const SizedBox(height: 10),
         Container(
@@ -877,6 +907,26 @@ class _AccountHomePageState extends State<AccountHomePage> {
             ],
           ),
         ),
+        _sectionHeading('Main Dashboards / مرکزی ڈیش بورڈ'),
+        if (unifiedOwner || v9StaffRole != null) Card(color: paleGreen, child: ListTile(
+          leading: const Icon(Icons.admin_panel_settings, color: deepGreen),
+          title: const Text('1. Admin & Staff'),
+          subtitle: Text(unifiedOwner ? 'Owner • Staff • Orders • Rates • Trades'
+              : 'Staff • Assigned order permissions'),
+          trailing: const Icon(Icons.chevron_right), onTap: _openTransferAdmin,
+        )),
+        Card(color: paleGreen, child: ListTile(
+          leading: const Icon(Icons.trending_up, color: deepGreen),
+          title: const Text('2. P2P Trading Investors'),
+          subtitle: const Text('Investments • Balance • Profit • Requests'),
+          trailing: const Icon(Icons.chevron_right), onTap: _openUnified,
+        )),
+        Card(color: paleGreen, child: ListTile(
+          leading: const Icon(Icons.currency_exchange, color: deepGreen),
+          title: const Text('3. AED to PKR'),
+          subtitle: const Text('Published Rate • Calculator • Sender • Receiver • Orders'),
+          trailing: const Icon(Icons.chevron_right), onTap: _openTransferCustomer,
+        )),
         _sectionHeading('Account Overview / اکاؤنٹ خلاصہ'),
         if (profile != null) _statusBanner(),
         if (profile == null && !loading)
@@ -1124,7 +1174,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
         ],
         Card(child: ListTile(
           leading: const Icon(Icons.people_outline, color: deepGreen),
-          title: Text(unifiedOwner ? 'Customer Accounts / فیملی و صارفین' : 'My Customer Dashboard'),
+          title: Text(unifiedOwner ? 'Customer Accounts / کسٹمر اکاؤنٹس' : 'My Customer Dashboard'),
           subtitle: Text(unifiedOwner ? 'Private balances, investments, support & profit reports'
               : 'View only your own statements'),
           trailing: const Icon(Icons.chevron_right), onTap: _openUnified,
@@ -1197,11 +1247,11 @@ class _AccountHomePageState extends State<AccountHomePage> {
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
-            'Sarmaya Plus • Unified Edition v8\n'
+            'Sarmaya Plus • Unified Edition v10\n'
             'Login: Firebase Authentication\n'
             'Account profile: Cloudflare API + D1\n'
             'KYC checklist and email-hide setting: stored on this device only\n\n'
-            'Only the verified personal owner may access this installation. Ledger entries are manual self-records, not money transmission, exchange or custodial balances.',
+            'Staff and customers can access only their permitted records. Trading journals and transfer orders are internal records; no banking or crypto transfer is executed by this app.',
           ),
         )),
       ];
@@ -2443,6 +2493,7 @@ class _UnifiedCustomerPageState extends State<UnifiedCustomerPage> {
   bool busy = false;
   String? error;
   List<Map<String,dynamic>> clients = [];
+  String customerSearch = '';
   List<Map<String,dynamic>> plans = [];
   List<Map<String,dynamic>> investments = [];
   List<Map<String,dynamic>> requests = [];
@@ -2530,15 +2581,55 @@ class _UnifiedCustomerPageState extends State<UnifiedCustomerPage> {
       FilledButton(onPressed:()=>Navigator.pop(ctx,ctrl.text.trim()),child:const Text('Save')),
     ])); } finally {ctrl.dispose();}
   }
-  Future<void> newClient() async {
-    final name=await textPrompt('New Customer / نیا کسٹمر','Full name');
-    if(name==null||name.length<2)return;
-    // Every person is a customer, regardless of family relationship or source of funds.
-    final currency=await choose('Currency',['PKR','AED','USDT']);
-    if(currency==null)return;
-    await perform(()async{await widget.request('POST','/v1/clients',{
-      'full_name':name,'relation':'customer','currency':currency,
-    });});
+  Future<void> newClient() async => customerForm();
+  Future<void> customerForm([Map<String,dynamic>? current]) async {
+    final name=TextEditingController(text:'${current?['full_name'] ?? ''}');
+    final phone=TextEditingController(text:'${current?['phone'] ?? ''}');
+    final email=TextEditingController(text:'${current?['email'] ?? ''}');
+    final address=TextEditingController(text:'${current?['address'] ?? ''}');
+    String currency='${current?['currency'] ?? 'PKR'}';
+    try {
+      final data=await showDialog<Map<String,String>>(context:context,builder:(ctx)=>StatefulBuilder(
+        builder:(ctx,change)=>AlertDialog(
+          title:Text(current==null?'Create Customer Account':'Edit Customer Profile'),
+          content:SingleChildScrollView(child:Column(mainAxisSize:MainAxisSize.min,children:[
+            TextField(controller:name,decoration:const InputDecoration(labelText:'Full Name *')),
+            const SizedBox(height:10),
+            TextField(controller:phone,keyboardType:TextInputType.phone,
+              decoration:const InputDecoration(labelText:'Mobile Number (optional)')),
+            const SizedBox(height:10),
+            TextField(controller:email,keyboardType:TextInputType.emailAddress,
+              decoration:const InputDecoration(labelText:'Email Address (optional)')),
+            const SizedBox(height:10),
+            TextField(controller:address,decoration:const InputDecoration(labelText:'Address (optional)')),
+            const SizedBox(height:10),
+            DropdownButtonFormField<String>(value:currency,
+              decoration:const InputDecoration(labelText:'Account Currency'),
+              items:const [
+                DropdownMenuItem(value:'PKR',child:Text('PKR')),
+                DropdownMenuItem(value:'AED',child:Text('AED')),
+                DropdownMenuItem(value:'USDT',child:Text('USDT')),
+              ],onChanged:(v){if(v!=null)change(()=>currency=v);}),
+          ])),
+          actions:[
+            TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),
+            FilledButton(onPressed:()=>Navigator.pop(ctx,{
+              'full_name':name.text.trim(),'phone':phone.text.trim(),
+              'email':email.text.trim(),'address':address.text.trim(),'currency':currency,
+            }),child:const Text('Save Customer')),
+          ],
+        ),
+      ));
+      if(data==null)return;
+      if((data['full_name']??'').length<2){alert('Full name is required.');return;}
+      if((data['email']??'').isNotEmpty && !(data['email']??'').contains('@')){
+        alert('Invalid customer email.');return;
+      }
+      await perform(()async{await widget.request('POST',
+        current==null?'/v1/clients':'/v1/clients/profile',{
+        ...data,if(current!=null)'client_id':current['id'],
+      });});
+    }finally{name.dispose();phone.dispose();email.dispose();address.dispose();}
   }
   Future<String?> choose(String title,List<String> values) async =>
     showDialog<String>(context:context,builder:(ctx)=>SimpleDialog(title:Text(title),children:values.map((v)=>
@@ -2612,6 +2703,23 @@ class _UnifiedCustomerPageState extends State<UnifiedCustomerPage> {
       final days=int.parse(duration);
       await perform(()async{await widget.request('POST','/v1/plans',{
         'title':title,'currency':currency,'min_amount_minor':min,'duration_days':days,
+      });});
+    }catch(e){alert('$e');}
+  }
+  Future<void> managePlan(Map<String,dynamic> p) async {
+    final enabled=await choose('Plan Status',['Enabled','Disabled']);
+    if(enabled==null)return;
+    final title=await textPrompt('Plan Title','Title',initial:'${p['title']}');
+    if(title==null)return;
+    final amount=await textPrompt('Minimum Investment','Amount in ${p['currency']}',
+      initial:showMoney(p['min_amount_minor'],'${p['currency']}').split(' ').first);
+    if(amount==null)return;
+    final duration=await textPrompt('Plan Duration','Days',initial:'${p['duration_days']}');
+    if(duration==null)return;
+    try {
+      await perform(()async{await widget.request('POST','/v1/plans/manage',{
+        'plan_id':p['plan_id'],'title':title,'min_amount_minor':moneyValue(amount,'${p['currency']}',allowZero:true),
+        'duration_days':int.parse(duration),'enabled':enabled=='Enabled',
       });});
     }catch(e){alert('$e');}
   }
@@ -2711,18 +2819,24 @@ class _UnifiedCustomerPageState extends State<UnifiedCustomerPage> {
     if(widget.owner)OutlinedButton.icon(onPressed:busy?null:copyCustomerBackup,
       icon:const Icon(Icons.copy_all_outlined),label:const Text('Copy Private JSON Backup')),
     tip(widget.owner
-      ? 'Every person is treated as a customer, regardless of relationship or who supplied the money. Customers cannot see your internal accounting.'
+      ? 'Each customer has a separate account and statement. Customers cannot see your internal trading costs or private accounting.'
       : 'You can see only accounts that Super Admin explicitly linked to your login.'),
-    ...clients.map((c)=>Card(child:Column(children:[
+    if(widget.owner)TextField(
+      decoration:const InputDecoration(prefixIcon:Icon(Icons.search),labelText:'Search Customer / Name / Code / Phone / Email'),
+      onChanged:(v)=>setState(()=>customerSearch=v.trim().toLowerCase())),
+    ...clients.where((c)=>!widget.owner || customerSearch.isEmpty ||
+      ['full_name','customer_code','phone','email'].any((k)=>'${c[k] ?? ''}'.toLowerCase().contains(customerSearch)))
+      .map((c)=>Card(child:Column(children:[
       ListTile(leading:const Icon(Icons.account_circle_outlined,color:deepGreen),
         title:Text('${c['full_name']}'),
-        subtitle:Text('Customer • ${c['status']} • ${c['currency']}'),
+        subtitle:Text('${c['customer_code'] ?? 'Customer'} • ${c['status']} • ${c['currency']}\n${c['phone'] ?? ''} ${c['email'] ?? ''}'),
         trailing:const Icon(Icons.chevron_right),
         onTap:()=>loadLedger('${c['id']}')),
       Padding(padding:const EdgeInsets.fromLTRB(16,0,16,10),child:Align(
         alignment:Alignment.centerLeft,child:Text('Recorded Balance: ${showMoney(c['balance_minor'],'${c['currency']}')}',
           style:const TextStyle(fontWeight:FontWeight.bold)))),
       if(widget.owner)Wrap(spacing:8,children:[
+        TextButton(onPressed:busy?null:()=>customerForm(c),child:const Text('Edit Profile')),
         TextButton(onPressed:busy?null:()=>linkClient(c),child:const Text('Link Login')),
         TextButton(onPressed:busy?null:()=>holdClient(c),child:Text(c['status']=='hold'?'Activate':'Hold')),
       ]),
@@ -2751,8 +2865,9 @@ class _UnifiedCustomerPageState extends State<UnifiedCustomerPage> {
       icon:const Icon(Icons.add),label:const Text('Create Plan')),
     ...plans.map((p)=>Card(child:ListTile(
       title:Text('${p['title']}'),
-      subtitle:Text('Min ${showMoney(p['min_amount_minor'],'${p['currency']}')} • ${p['duration_days']} days'),
-      trailing:Text(p['enabled']==1?'Active':'Disabled')))),
+      subtitle:Text('Min ${showMoney(p['min_amount_minor'],'${p['currency']}')} • ${p['duration_days']} days • ${p['enabled']==1?'Active':'Disabled'}'),
+      trailing:widget.owner?IconButton(icon:const Icon(Icons.edit),
+        onPressed:busy?null:()=>managePlan(p)):null))),
     intro('Investment Records / سرمایہ کاری ریکارڈ'),
     if(widget.owner)FilledButton.icon(onPressed:busy?null:newInvestment,
       icon:const Icon(Icons.add_chart),label:const Text('Assign Investment')),
