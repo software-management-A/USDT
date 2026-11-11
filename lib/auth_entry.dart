@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
@@ -13,9 +15,9 @@ import 'firebase_options.dart';
 typedef ApiRequest = Future<Map<String, dynamic>> Function(
     String method, String path, [Map<String, dynamic>? body]);
 
-// Sarmaya Plus — Account Dashboard v5: notifications, search, reports and reviewer roles
+// Sarmaya Plus v7 Personal Edition: private manual ledger and existing admin/KYC
 // Firebase Email/Password + verified Cloudflare /v1/me profile.
-// No deposits, withdrawals, trading, investment or KYC document submission.
+// No real money/crypto transfers, order execution or KYC document submission.
 const Color deepGreen = Color(0xFF123F2B);
 const Color paleGreen = Color(0xFFEAF3EC);
 const Color paper = Color(0xFFF5F7F3);
@@ -83,7 +85,7 @@ class AuthGate extends StatelessWidget {
           final user = snapshot.data;
           if (user == null) return const AccountPage();
           if (!user.emailVerified) return VerifyEmailPage(user: user);
-          return AccountHomePage(key: ValueKey(user.uid), user: user);
+          return UnifiedAccessGate(key: ValueKey(user.uid), user: user);
         },
       );
 }
@@ -292,11 +294,10 @@ class _AccountPageState extends State<AccountPage> {
                     onPressed: busy ? null : submit,
                     child: Text(busy ? 'Please wait...' : (signup ? 'Create Account' : 'Login')),
                   ),
-                  TextButton(
-                    onPressed: busy
-                        ? null
-                        : () => setState(() { signup = !signup; message = null; }),
-                    child: Text(signup ? 'Already registered? Login' : 'New user? Create account'),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 8),
+                    child: Text('Personal owner-only edition • New public registrations are disabled.',
+                      style: TextStyle(fontSize: 12, color: Colors.black54)),
                   ),
                   if (!signup)
                     TextButton(
@@ -410,6 +411,10 @@ class _AccountHomePageState extends State<AccountHomePage> {
   bool kycAcknowledged = false;
   String? adminRole;
   int unreadNotifications = 0;
+  bool personalEnabled = false;
+  bool unifiedOwner = false;
+  String unifiedMode = 'PERSONAL';
+  Map<String, dynamic> personalSummary = {};
   String? kycError;
   Map<String, dynamic>? kycRequest;
   final List<bool> readyChecklist = [false, false, false];
@@ -496,6 +501,11 @@ class _AccountHomePageState extends State<AccountHomePage> {
           await prefs.remove(registrationKey);
         }
       }
+      final currentMode = await authenticatedRequest('GET', '/v1/platform/status');
+      if (mounted) setState(() {
+        unifiedOwner = currentMode['is_super_admin'] == true;
+        unifiedMode = currentMode['mode']?.toString() ?? 'PERSONAL';
+      });
       final result = await authenticatedRequest('GET', '/v1/me');
       if (!mounted) return;
       setState(() {
@@ -523,6 +533,16 @@ class _AccountHomePageState extends State<AccountHomePage> {
             (notifications['unread'] as num?)?.toInt() ?? 0);
       } catch (_) {
         // Keep existing cloud profile available if notifications are temporarily offline.
+      }
+      // Owner-only personal records; never infer access from local device state.
+      try {
+        final personal = await authenticatedRequest('GET', '/v1/personal/summary');
+        if (mounted) setState(() {
+          personalEnabled = personal['personal_only'] == true;
+          personalSummary = personal;
+        });
+      } catch (_) {
+        if (mounted) setState(() { personalEnabled = false; personalSummary = {}; });
       }
       // Ordinary accounts get no Admin button. A verified UID alone is insufficient.
       try {
@@ -809,6 +829,28 @@ class _AccountHomePageState extends State<AccountHomePage> {
     if (mounted) refreshProfile();
   }
 
+  Future<void> _openUnified() async {
+    await Navigator.push(context, MaterialPageRoute(
+      builder: (_) => UnifiedCustomerPage(request: authenticatedRequest,
+        owner: unifiedOwner, mode: unifiedMode),
+    ));
+    if (mounted) refreshProfile();
+  }
+
+  Future<void> _openModeControl() async {
+    await Navigator.push(context, MaterialPageRoute(
+      builder: (_) => UnifiedModePage(request: authenticatedRequest),
+    ));
+    if (mounted) refreshProfile();
+  }
+
+  Future<void> _openPersonal() async {
+    await Navigator.push(context, MaterialPageRoute(
+      builder: (_) => PersonalLedgerPage(request: authenticatedRequest, ownerName: cloudName),
+    ));
+    if (mounted) refreshProfile();
+  }
+
   List<Widget> _homeWidgets() => [
         const SizedBox(height: 10),
         Container(
@@ -877,6 +919,27 @@ class _AccountHomePageState extends State<AccountHomePage> {
             onTap: () => setState(() => tab = 3),
           ),
         ])),
+        _sectionHeading(unifiedOwner ? 'Customer Accounts / کسٹمر اکاؤنٹس'
+            : 'My Customer Account / میرا حساب'),
+        Card(color: paleGreen, child: ListTile(
+          leading: const Icon(Icons.groups_2_outlined, color: deepGreen),
+          title: Text(unifiedOwner ? 'Customers, Investments & Profit Distribution'
+              : 'My Balance, Statements & Requests'),
+          subtitle: Text(unifiedOwner
+              ? 'A separate private customer ledger for every person'
+              : 'Only your linked customer records are visible'),
+          trailing: const Icon(Icons.chevron_right), onTap: _openUnified,
+        )),
+        if (personalEnabled) ...[
+          _sectionHeading('My Personal Finance / ذاتی مالی ریکارڈ'),
+          Card(color: paleGreen, child: ListTile(
+            leading: const Icon(Icons.account_balance_wallet_outlined, color: deepGreen),
+            title: const Text('Private Ledger & USDT Journal / ذاتی حساب'),
+            subtitle: Text('Manual PKR, AED & USDT records • ${personalSummary['journal_count'] ?? 0} entries'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _openPersonal,
+          )),
+        ],
         _sectionHeading('Service availability'),
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
@@ -884,7 +947,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
             Icon(Icons.lock_outline, color: deepGreen),
             SizedBox(width: 12),
             Expanded(child: Text(
-              'Deposits, withdrawals, USDT P2P, trading, investments, financial balances and referral rewards are not enabled. No money is held or moved by this dashboard.',
+              'The customer accounts and trading journal record manual transactions. The app does not connect to banks, payment gateways or exchanges to move money.',
             )),
           ]),
         )),
@@ -1049,6 +1112,23 @@ class _AccountHomePageState extends State<AccountHomePage> {
       ];
 
   List<Widget> _settingsWidgets() => [
+        if (unifiedOwner) ...[
+          _sectionHeading('Super Admin / سپر ایڈمن'),
+          Card(child: ListTile(
+            leading: const Icon(Icons.toggle_on_outlined, color: deepGreen),
+            title: Text('Application Mode: $unifiedMode'),
+            subtitle: const Text('Personal / Multi-User • freeze & restore customer access'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _openModeControl,
+          )),
+        ],
+        Card(child: ListTile(
+          leading: const Icon(Icons.people_outline, color: deepGreen),
+          title: Text(unifiedOwner ? 'Customer Accounts / فیملی و صارفین' : 'My Customer Dashboard'),
+          subtitle: Text(unifiedOwner ? 'Private balances, investments, support & profit reports'
+              : 'View only your own statements'),
+          trailing: const Icon(Icons.chevron_right), onTap: _openUnified,
+        )),
         if (adminRole != null) ...[
           _sectionHeading('Admin Console / ایڈمن'),
           Card(child: ListTile(
@@ -1061,6 +1141,12 @@ class _AccountHomePageState extends State<AccountHomePage> {
             )),
           )),
         ],
+        if (personalEnabled) Card(child: ListTile(
+          leading: const Icon(Icons.wallet_outlined, color: deepGreen),
+          title: const Text('Personal Ledger / ذاتی مالی ریکارڈ'),
+          subtitle: const Text('Income, expenses, USDT trades (manual), reports'),
+          trailing: const Icon(Icons.chevron_right), onTap: _openPersonal,
+        )),
         _sectionHeading('Account Settings / اکاؤنٹ سیٹنگز'),
         Card(child: Column(children: [
           ListTile(
@@ -1111,11 +1197,11 @@ class _AccountHomePageState extends State<AccountHomePage> {
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
-            'Sarmaya Plus • Account Dashboard v5\n'
+            'Sarmaya Plus • Unified Edition v8\n'
             'Login: Firebase Authentication\n'
             'Account profile: Cloudflare API + D1\n'
             'KYC checklist and email-hide setting: stored on this device only\n\n'
-            'KYC review requests store only the requesting account ID and status in Cloudflare. Identity document uploads and financial services remain disabled.',
+            'Only the verified personal owner may access this installation. Ledger entries are manual self-records, not money transmission, exchange or custodial balances.',
           ),
         )),
       ];
@@ -1708,4 +1794,1047 @@ class _NotificationsPageState extends State<NotificationsPage> {
       ]),
     ),
   );
+}
+
+
+
+// Sarmaya Plus Personal Edition: authenticated, owner-only bookkeeping.
+// This journal NEVER sends or receives real money, crypto, or investment orders.
+class PersonalLedgerPage extends StatefulWidget {
+  const PersonalLedgerPage({super.key, required this.request, required this.ownerName});
+  final ApiRequest request;
+  final String ownerName;
+  @override
+  State<PersonalLedgerPage> createState() => _PersonalLedgerPageState();
+}
+
+class _PersonalLedgerPageState extends State<PersonalLedgerPage> {
+  bool loading = true;
+  bool saving = false;
+  bool urdu = false;
+  String? error;
+  int days = 30;
+  int offset = 0;
+  List<Map<String, dynamic>> accounts = [];
+  List<Map<String, dynamic>> events = [];
+  List<Map<String, dynamic>> positions = [];
+  Map<String, dynamic> reports = {};
+  int journalCount = 0;
+
+  String t(String english, String urduText) => urdu ? urduText : english;
+  List<Map<String, dynamic>> maps(Object? value) =>
+      value is List ? value.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList() : [];
+  String money(Object? raw, String currency) {
+    final n = raw is num ? raw.toInt() : int.tryParse('$raw') ?? 0;
+    final d = currency == 'USDT' ? 6 : 2;
+    final power = d == 6 ? 1000000 : 100;
+    final negative = n < 0 ? '-' : '';
+    final abs = n.abs();
+    return '$negative${abs ~/ power}.${(abs % power).toString().padLeft(d, '0')} $currency';
+  }
+  String accountName(String? id) {
+    for (final a in accounts) {
+      if (a['account_id'] == id) return '${a['name']} (${a['currency']})';
+    }
+    return id == null ? t('Outside app', 'بیرونی اکاؤنٹ') : t('Unknown account', 'نامعلوم اکاؤنٹ');
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _loadLanguage();
+    refresh();
+  }
+  Future<void> _loadLanguage() async {
+    final p = await SharedPreferences.getInstance();
+    if (mounted) setState(() => urdu = p.getBool('personal_urdu') ?? false);
+  }
+  Future<void> changeLanguage(bool value) async {
+    final p = await SharedPreferences.getInstance();
+    await p.setBool('personal_urdu', value);
+    if (mounted) setState(() => urdu = value);
+  }
+  void message(String value) {
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(value)));
+  }
+  Future<void> refresh() async {
+    if (!mounted) return;
+    setState(() { loading = true; error = null; });
+    try {
+      final data = await widget.request('GET', '/v1/personal/summary');
+      final list = await widget.request('GET', '/v1/personal/entries?offset=$offset');
+      final report = await widget.request('GET', '/v1/personal/reports?days=$days');
+      if (!mounted) return;
+      setState(() {
+        accounts = maps(data['accounts']);
+        positions = maps(data['positions']);
+        events = maps(list['events']);
+        reports = report;
+        journalCount = (data['journal_count'] as num?)?.toInt() ?? 0;
+      });
+    } catch (e) {
+      if (mounted) setState(() => error = e.toString());
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+  Future<void> perform(Future<Map<String, dynamic>> Function() action) async {
+    if (saving) return;
+    setState(() => saving = true);
+    try {
+      await action();
+      message(t('Saved to private cloud journal', 'ذاتی کلاؤڈ ریکارڈ محفوظ ہوگیا'));
+      await refresh();
+    } catch (e) {
+      message('$e');
+    } finally {
+      if (mounted) setState(() => saving = false);
+    }
+  }
+  Widget label(String title, {IconData icon = Icons.info_outline}) => Padding(
+    padding: const EdgeInsets.symmetric(vertical: 12),
+    child: Row(children: [Icon(icon, color: deepGreen), const SizedBox(width: 9),
+      Expanded(child: Text(title, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: deepGreen)))]),
+  );
+  Widget info(String text) => Card(child: Padding(
+    padding: const EdgeInsets.all(14), child: Text(text)));
+  Widget accountCard(Map<String, dynamic> a) => Card(child: ListTile(
+    leading: const CircleAvatar(backgroundColor: paleGreen, child: Icon(Icons.account_balance_wallet_outlined, color: deepGreen)),
+    title: Text('${a['name']}'),
+    subtitle: Text('${a['kind']} • ${a['currency']}'),
+    trailing: Text(money(a['balance_minor'], '${a['currency']}'),
+      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
+  ));
+  String typeLabel(String type) {
+    switch (type) {
+      case 'income': return t('Manual money in', 'آمدن کا ریکارڈ');
+      case 'expense': return t('Manual expense', 'اخراجات کا ریکارڈ');
+      case 'transfer': return t('Internal transfer', 'اندرونی منتقلی');
+      case 'p2p_buy': return t('USDT purchase journal', 'USDT خریداری کا ریکارڈ');
+      case 'p2p_sell': return t('USDT sale journal', 'USDT فروخت کا ریکارڈ');
+      default: return t('Reversal', 'واپسی / تصحیح');
+    }
+  }
+
+  Future<void> newAccount() async {
+    final name = TextEditingController();
+    String currency = 'AED';
+    String kind = 'wallet';
+    final data = await showDialog<Map<String, String>>(context: context, builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setModal) => AlertDialog(
+        title: Text(t('New private account', 'نیا ذاتی اکاؤنٹ')),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: name, maxLength: 60, decoration: InputDecoration(labelText: t('Name', 'نام'))),
+          DropdownButtonFormField<String>(value: currency, decoration: InputDecoration(labelText: t('Currency', 'کرنسی')),
+            items: ['PKR', 'AED', 'USDT'].map((x) => DropdownMenuItem(value: x, child: Text(x))).toList(),
+            onChanged: (v) => setModal(() => currency = v ?? currency)),
+          const SizedBox(height: 10),
+          DropdownButtonFormField<String>(value: kind, decoration: InputDecoration(labelText: t('Account type', 'اکاؤنٹ کی قسم')),
+            items: ['cash','bank','wallet','exchange','other']
+              .map((x) => DropdownMenuItem(value: x, child: Text(x))).toList(),
+            onChanged: (v) => setModal(() => kind = v ?? kind)),
+        ])),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: Text(t('Cancel', 'منسوخ'))),
+          FilledButton(onPressed: () => Navigator.pop(ctx, {
+            'name': name.text.trim(), 'currency': currency, 'kind': kind,
+          }), child: Text(t('Create', 'بنائیں')))],
+      ),
+    ));
+    name.dispose();
+    if (data == null) return;
+    await perform(() => widget.request('POST','/v1/personal/accounts', data));
+  }
+
+  Future<void> newEntry() async {
+    if (accounts.isEmpty) { message(t('Create an account first', 'پہلے اکاؤنٹ بنائیں')); return; }
+    String type = 'income';
+    String accountId = '${accounts.first['account_id']}';
+    String toId = accounts.length > 1 ? '${accounts[1]['account_id']}' : accountId;
+    final amount = TextEditingController();
+    final received = TextEditingController();
+    final note = TextEditingController();
+    final tradeProfit = TextEditingController();
+    final data = await showDialog<Map<String, dynamic>>(context: context, builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setModal) => AlertDialog(
+        title: Text(t('Record manually', 'دستی ریکارڈ درج کریں')),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text(t('This DOES NOT send money or place trades.', 'اس سے رقم منتقل یا ٹریڈ نہیں ہوتی۔'),
+            style: const TextStyle(fontSize: 12, color: Colors.deepOrange)),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(value: type, isExpanded: true,
+            decoration: InputDecoration(labelText: t('Entry type', 'اندراج کی قسم')),
+            items: ['income','expense','transfer','p2p_buy','p2p_sell']
+              .map((x) => DropdownMenuItem(value: x, child: Text(typeLabel(x)))).toList(),
+            onChanged: (v) => setModal(() => type = v ?? type)),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(value: accountId, isExpanded: true,
+            decoration: InputDecoration(labelText: t('Main account', 'بنیادی اکاؤنٹ')),
+            items: accounts.map((a) => DropdownMenuItem(value: '${a['account_id']}',
+              child: Text('${a['name']} (${a['currency']})', overflow: TextOverflow.ellipsis))).toList(),
+            onChanged: (v) => setModal(() => accountId = v ?? accountId)),
+          const SizedBox(height: 12),
+          TextField(controller: amount, keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(labelText: t('Main amount', 'بنیادی رقم'), hintText: '100.00')),
+          if (!['income','expense'].contains(type)) ...[
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(value: toId, isExpanded: true,
+              decoration: InputDecoration(labelText: t('Destination account', 'منزل اکاؤنٹ')),
+              items: accounts.map((a) => DropdownMenuItem(value: '${a['account_id']}',
+                child: Text('${a['name']} (${a['currency']})', overflow: TextOverflow.ellipsis))).toList(),
+              onChanged: (v) => setModal(() => toId = v ?? toId)),
+          ],
+          if (type == 'p2p_buy' || type == 'p2p_sell') ...[
+            const SizedBox(height: 12),
+            TextField(controller: received, keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: InputDecoration(labelText: t('Received amount', 'موصول رقم'), hintText: '25.000000')),
+          ],
+          if (type == 'p2p_sell') ...[
+            const SizedBox(height: 12),
+            TextField(controller: tradeProfit, keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+              decoration: InputDecoration(labelText: t('Your estimated profit/loss (optional)',
+                'آپ کا اندازاً نفع/نقصان (اختیاری)'), hintText: '2.50 or -1.00')),
+          ],
+          const SizedBox(height: 12),
+          TextField(controller: note, maxLength: 160,
+            decoration: InputDecoration(labelText: t('Note (optional)', 'نوٹ (اختیاری)'))),
+          const SizedBox(height: 5),
+          Text(t('Buy: fiat → USDT. Sell: USDT → fiat. Transfer: same currency.',
+            'خرید: رقم سے USDT، فروخت: USDT سے رقم۔ منتقلی: ایک ہی کرنسی۔'),
+            style: const TextStyle(fontSize: 11, color: Colors.black54)),
+        ])),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: Text(t('Cancel', 'منسوخ'))),
+          FilledButton(onPressed: () => Navigator.pop(ctx, {
+            'type': type, 'account_id': accountId, 'to_account_id': toId,
+            'amount': amount.text.trim(), 'received_amount': received.text.trim(),
+            'note': note.text.trim(), 'trade_profit': tradeProfit.text.trim(),
+          }), child: Text(t('Save record', 'ریکارڈ محفوظ کریں')))],
+      ),
+    ));
+    amount.dispose(); received.dispose(); note.dispose(); tradeProfit.dispose();
+    if (data == null) return;
+    data['request_id'] = 'p_${DateTime.now().microsecondsSinceEpoch}_${Random.secure().nextInt(1000000000)}';
+    await perform(() => widget.request('POST', '/v1/personal/entries', data));
+  }
+
+  Future<void> reverseEntry(Map<String, dynamic> e) async {
+    final ok = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+      title: Text(t('Reverse this record?', 'یہ اندراج واپس کریں؟')),
+      content: Text(t('An opposite journal entry will be created; history is not deleted. If the balance is too low, reversal will be rejected.',
+        'الٹا اندراج بنے گا، تاریخ حذف نہیں ہوگی۔ بیلنس کم ہوا تو عمل رد ہوگا۔')),
+      actions: [TextButton(onPressed: () => Navigator.pop(ctx,false),child: Text(t('Cancel', 'منسوخ'))),
+        FilledButton(onPressed: () => Navigator.pop(ctx,true), child: Text(t('Confirm', 'تصدیق')))],
+    ));
+    if (ok != true) return;
+    await perform(() => widget.request('POST', '/v1/personal/reverse', {'event_id': e['event_id']}));
+  }
+
+  Future<void> editPosition([Map<String, dynamic>? existing]) async {
+    final asset = TextEditingController(text: '${existing?['asset_name'] ?? ''}');
+    final units = TextEditingController(text: existing == null ? '' : money(existing['units_micros'], 'USDT').split(' ').first);
+    final cost = TextEditingController(text: existing == null ? '' : money(existing['cost_minor'], '${existing['quote_currency']}').split(' ').first);
+    final value = TextEditingController(text: existing == null ? '' : money(existing['current_value_minor'], '${existing['quote_currency']}').split(' ').first);
+    final notes = TextEditingController(text: '${existing?['notes'] ?? ''}');
+    String currency = '${existing?['quote_currency'] ?? 'AED'}';
+    final data = await showDialog<Map<String, dynamic>>(context: context, builder: (ctx) => StatefulBuilder(
+      builder: (ctx, setModal) => AlertDialog(
+        title: Text(t('Manual investment valuation', 'سرمایہ کاری کی دستی قیمت')),
+        content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          TextField(controller: asset, maxLength: 60,
+            decoration: InputDecoration(labelText: t('Asset (e.g. USDT, gold)', 'اثاثہ (USDT، سونا وغیرہ)'))),
+          TextField(controller: units, keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(labelText: t('Units (max 6 decimals)', 'تعداد (6 اعشاری مقامات)'))),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<String>(value: currency,
+            decoration: InputDecoration(labelText: t('Value currency', 'قیمت کی کرنسی')),
+            items: ['AED','PKR'].map((x) => DropdownMenuItem(value: x,child: Text(x))).toList(),
+            onChanged: (v) => setModal(() => currency = v ?? currency)),
+          const SizedBox(height: 12),
+          TextField(controller: cost, keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(labelText: t('Original cost', 'اصل لاگت'))),
+          const SizedBox(height: 12),
+          TextField(controller: value, keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(labelText: t('Estimated current value', 'موجودہ اندازاً قیمت'))),
+          const SizedBox(height: 12),
+          TextField(controller: notes, maxLength: 160,
+            decoration: InputDecoration(labelText: t('Notes', 'نوٹس'))),
+        ])),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: Text(t('Cancel','منسوخ'))),
+          FilledButton(onPressed: () => Navigator.pop(ctx, {
+            if (existing != null) 'position_id': existing['position_id'],
+            'asset_name': asset.text.trim(), 'units': units.text.trim(),
+            'quote_currency': currency, 'cost': cost.text.trim(),
+            'current_value': value.text.trim(), 'notes': notes.text.trim(),
+          }), child: Text(t('Save','محفوظ کریں')))],
+      ),
+    ));
+    asset.dispose(); units.dispose(); cost.dispose(); value.dispose(); notes.dispose();
+    if (data == null) return;
+    await perform(() => widget.request('POST','/v1/personal/positions',data));
+  }
+
+  Future<void> exportCopy() async {
+    final sure = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+      title: Text(t('Copy private JSON backup?', 'ذاتی JSON بیک اپ کاپی کریں؟')),
+      content: Text(t('This copies sensitive personal financial records to your phone clipboard. Copy it only into a private safe place. Maximum 1,000 records per backup.',
+        'اس سے ذاتی مالی ریکارڈ فون کے کلپ بورڈ میں جائے گا۔ صرف محفوظ جگہ رکھیں۔ زیادہ سے زیادہ 1000 ریکارڈ۔')),
+      actions: [TextButton(onPressed: () => Navigator.pop(ctx,false), child: Text(t('Cancel','منسوخ'))),
+        FilledButton(onPressed: () => Navigator.pop(ctx,true), child: Text(t('Copy','کاپی')))],
+    ));
+    if (sure != true) return;
+    try {
+      final result = await widget.request('GET','/v1/personal/export');
+      await Clipboard.setData(ClipboardData(text: const JsonEncoder.withIndent('  ').convert(result)));
+      message(result['truncated'] == true
+        ? t('Partial backup copied: export exceeds limit','جزوی بیک اپ کاپی ہوا، ریکارڈ زیادہ ہیں')
+        : t('Private backup copied','ذاتی بیک اپ کاپی ہوگیا'));
+    } catch (e) { message('$e'); }
+  }
+
+  List<Widget> overview() => [
+    label(t('Personal money tracker', 'ذاتی مالی ریکارڈ'), icon: Icons.wallet_outlined),
+    info(t('Only your verified account can open these records. No funds, payments or USDT are held, moved, or traded by this app.',
+      'یہ صرف آپ کے ذاتی اکاؤنٹ کا ریکارڈ ہے۔ ایپ سے رقم یا USDT وصول، منتقل یا ٹریڈ نہیں ہوتی۔')),
+    Card(color: paleGreen, child: Padding(padding: const EdgeInsets.all(17), child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(t('Welcome, ${widget.ownerName}', 'خوش آمدید، ${widget.ownerName}'),
+          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 19)),
+        const SizedBox(height: 8),
+        Text(t('$journalCount journal records', '$journalCount اندراجات')),
+        const SizedBox(height: 9),
+        ...['AED','PKR','USDT'].map((c) {
+          final minor = accounts.where((a) => a['currency'] == c)
+            .fold<int>(0, (sum, a) => sum + ((a['balance_minor'] as num?)?.toInt() ?? 0));
+          return Padding(padding: const EdgeInsets.symmetric(vertical: 4),
+            child: Text(money(minor,c), style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 17)));
+        }),
+      ]))),
+    const SizedBox(height: 14),
+    FilledButton.icon(onPressed: saving ? null : newEntry,
+      icon: const Icon(Icons.add), label: Text(t('Add manual transaction', 'نیا دستی اندراج'))),
+    const SizedBox(height: 8),
+    OutlinedButton.icon(onPressed: saving ? null : newAccount,
+      icon: const Icon(Icons.add_card_outlined), label: Text(t('Create account', 'نیا اکاؤنٹ'))),
+    label(t('Your accounts', 'آپ کے اکاؤنٹس'), icon: Icons.account_balance_wallet_outlined),
+    ...accounts.map(accountCard),
+  ];
+  List<Widget> accountWidgets() => [
+    label(t('Cash, bank and wallet records', 'کیش، بینک اور والٹ کا ریکارڈ'), icon: Icons.account_balance),
+    OutlinedButton.icon(onPressed: saving ? null : newAccount,
+      icon: const Icon(Icons.add), label: Text(t('New account','نیا اکاؤنٹ'))),
+    const SizedBox(height: 8),
+    ...accounts.map(accountCard),
+    info(t('Balances are self-entered bookkeeping values, not verified bank or blockchain balances.',
+      'یہ آپ کا دستی حساب ہے، حقیقی بینک یا بلاک چین بیلنس کی تصدیق نہیں۔')),
+  ];
+  List<Widget> journalWidgets() => [
+    label(t('Immutable transaction journal', 'مستقل لین دین ریکارڈ'), icon: Icons.receipt_long),
+    FilledButton.icon(onPressed: saving ? null : newEntry, icon: const Icon(Icons.add),
+      label: Text(t('Add record','نیا اندراج'))),
+    ...events.map((e) {
+      final postings = maps(e['postings']);
+      final visible = postings.where((p) => p['account_id'] != null).toList();
+      final reversed = e['reversed_by'] != null || e['reverse_of'] != null;
+      return Card(child: Padding(padding: const EdgeInsets.all(12),child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,children: [
+          Row(children: [Expanded(child: Text(typeLabel('${e['type']}'),
+            style: const TextStyle(fontWeight: FontWeight.bold))),
+            if (!reversed) IconButton(tooltip: t('Reverse','واپس کریں'), onPressed: saving ? null : () => reverseEntry(e),
+              icon: const Icon(Icons.undo_outlined))]),
+          Text('${e['created_at'] ?? ''}', style: const TextStyle(fontSize: 12, color: Colors.black54)),
+          if (reversed) Text(t('Reversed / correction','واپس / تصحیح'),
+            style: const TextStyle(color: Colors.deepOrange)),
+          if (e['trade_pnl_minor'] != null) Text(
+            '${t('Self-reported P/L', 'اپنا درج کردہ نفع/نقصان')}: '
+            '${money(e['trade_pnl_minor'], '${e['trade_pnl_currency']}')}'),
+          if ('${e['note'] ?? ''}'.isNotEmpty) Text('${e['note']}'),
+          ...visible.map((p) => Text('${accountName(p['account_id']?.toString())}: '
+            '${money(p['amount_minor'], '${p['currency']}')}')),
+        ])));
+    }),
+    if (events.isEmpty) info(t('No records yet. Start with a manual money-in entry.',
+      'ابھی ریکارڈ نہیں۔ پہلے دستی آمدن درج کریں۔')),
+    Row(children: [
+      TextButton(onPressed: offset == 0 || loading ? null : () { offset = (offset - 40).clamp(0, 100000).toInt(); refresh(); },
+        child: Text(t('Previous','پچھلا'))),
+      Text('${offset + 1}–${offset + events.length}'),
+      TextButton(onPressed: events.length < 40 || loading ? null : () { offset += 40; refresh(); },
+        child: Text(t('Next','اگلا'))),
+    ]),
+  ];
+  List<Widget> portfolioWidgets() => [
+    label(t('Investment watchlist (manual)', 'سرمایہ کاری کی دستی فہرست'),icon: Icons.trending_up),
+    info(t('Valuations are estimates entered by you and are NOT counted as cash or certified realized profit.',
+      'قیمتیں آپ نے خود درج کی ہیں؛ یہ کیش بیلنس یا تصدیق شدہ منافع نہیں۔')),
+    FilledButton.icon(onPressed: saving ? null : () => editPosition(), icon: const Icon(Icons.add_chart),
+      label: Text(t('Add investment / asset','اثاثہ درج کریں'))),
+    ...positions.map((p) {
+      final currency = '${p['quote_currency']}';
+      final profit = (p['current_value_minor'] as num).toInt() - (p['cost_minor'] as num).toInt();
+      return Card(child: ListTile(
+        title: Text('${p['asset_name']}', style: const TextStyle(fontWeight: FontWeight.bold)),
+        subtitle: Text('${money(p['units_micros'], 'USDT').split(' ').first} units • '
+          '${t('Cost', 'لاگت')}: ${money(p['cost_minor'],currency)} • '
+          '${t('Value', 'قیمت')}: ${money(p['current_value_minor'],currency)}\n'
+          '${t('Unrealized estimate','غیر حقیقی اندازاً منافع')}: ${money(profit,currency)}'),
+        trailing: IconButton(icon: const Icon(Icons.edit_outlined), onPressed: saving ? null : () => editPosition(p)),
+      ));
+    }),
+  ];
+  List<Widget> reportWidgets() {
+    final types = maps(reports['by_type']);
+    final flows = maps(reports['income_expense']);
+    final pnl = maps(reports['self_reported_trade_pnl']);
+    return [
+      label(t('Activity reports', 'سرگرمی کی رپورٹس'),icon: Icons.assessment_outlined),
+      Wrap(spacing: 8, children: [7,30,90,365].map((d) => ChoiceChip(
+        label: Text('$d ${t('days','دن')}'), selected: days == d,
+        onSelected: (v) { if (v) { days = d; refresh(); } },
+      )).toList()),
+      info(t('These are manual journal summaries, not bank statements, realized trading returns, or tax reports.',
+        'یہ دستی حساب کی رپورٹ ہے، بینک اسٹیٹمنٹ یا تصدیق شدہ نفع / ٹیکس رپورٹ نہیں۔')),
+      ...types.map((x) => Card(child: ListTile(
+        title: Text(typeLabel('${x['type']}')), trailing: Text('${x['n']}')))),
+      label(t('Income and expenses', 'آمدن اور اخراجات'), icon: Icons.analytics_outlined),
+      ...flows.map((x) => Card(child: ListTile(
+        title: Text(typeLabel('${x['type']}')), trailing: Text(money(x['amount_minor'],'${x['currency']}'))))),
+      label(t('Your entered USDT sale profit/loss', 'آپ کا درج کردہ USDT نفع/نقصان'), icon: Icons.trending_up),
+      ...pnl.map((x) => Card(child: ListTile(
+        title: Text(t('Estimated P/L from your entries', 'دستی اندراج سے اندازاً نفع/نقصان')),
+        trailing: Text(money(x['pnl_minor'], '${x['currency']}'))))),
+      OutlinedButton.icon(onPressed: exportCopy, icon: const Icon(Icons.copy_all_outlined),
+        label: Text(t('Copy private JSON backup','ذاتی JSON بیک اپ کاپی کریں'))),
+      SwitchListTile(title: Text(t('Urdu language for personal pages','ذاتی صفحات اردو میں')),
+        value: urdu, onChanged: changeLanguage),
+    ];
+  }
+
+  @override
+  Widget build(BuildContext context) => Directionality(
+    textDirection: urdu ? TextDirection.rtl : TextDirection.ltr,
+    child: DefaultTabController(length: 5, child: Scaffold(
+      appBar: AppBar(
+        title: Text(t('My Personal Ledger', 'میرا ذاتی حساب')),
+        actions: [IconButton(onPressed: loading ? null : refresh,
+          icon: const Icon(Icons.refresh), tooltip: t('Refresh','تازہ کریں'))],
+        bottom: TabBar(isScrollable: true, tabAlignment: TabAlignment.start, tabs: [
+          Tab(text: t('Overview','خلاصہ')),
+          Tab(text: t('Accounts','اکاؤنٹس')),
+          Tab(text: t('Journal','اندراجات')),
+          Tab(text: t('Investments','سرمایہ کاری')),
+          Tab(text: t('Reports','رپورٹس')),
+        ]),
+      ),
+      body: Column(children: [
+        if (loading) const LinearProgressIndicator(minHeight: 3),
+        if (error != null) Card(child: Padding(padding: const EdgeInsets.all(14),
+          child: Text(error!, style: const TextStyle(color: Colors.red)))),
+        Expanded(child: TabBarView(children: [
+          overview(), accountWidgets(), journalWidgets(), portfolioWidgets(), reportWidgets(),
+        ].map((children) => RefreshIndicator(onRefresh: refresh,
+          child: ListView(padding: const EdgeInsets.all(14), children: children))).toList())),
+      ]),
+    )),
+  );
+}
+// Sarmaya Plus Unified Edition — Personal and Multi-User modes.
+// Firebase identity is verified by Worker on every request. This UI holds no admin secrets.
+typedef UnifiedRequest = Future<Map<String, dynamic>> Function(
+    String method, String path, [Map<String, dynamic>? body]);
+
+class UnifiedAccessGate extends StatefulWidget {
+  const UnifiedAccessGate({super.key, required this.user});
+  final User user;
+  @override
+  State<UnifiedAccessGate> createState() => _UnifiedAccessGateState();
+}
+
+class _UnifiedAccessGateState extends State<UnifiedAccessGate>
+    with WidgetsBindingObserver {
+  bool loading = true;
+  bool frozen = false;
+  String? error;
+  Timer? monitor;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    check();
+    // Also freeze a customer already using the app when owner changes mode.
+    monitor = Timer.periodic(const Duration(seconds: 30), (_) => check(silent: true));
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) check(silent: true);
+  }
+
+  Future<void> check({bool silent = false}) async {
+    try {
+      final token = await widget.user.getIdToken();
+      if (token == null) throw Exception('Login session unavailable');
+      final http = HttpClient()..connectionTimeout = const Duration(seconds: 12);
+      try {
+        final req = await http.getUrl(Uri.parse('$apiBase/v1/platform/status'));
+        req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        final response = await req.close().timeout(const Duration(seconds: 15));
+        final value = jsonDecode(await utf8.decoder.bind(response).join());
+        if (response.statusCode != 200 || value is! Map<String, dynamic>) {
+          throw Exception(value is Map ? '${value['error']}' : 'System mode unavailable');
+        }
+        final next = value['account_frozen'] == true;
+        if (mounted && next && !frozen) {
+          // Close customer detail routes so prior cached account data is not visible
+          // after Super Admin switches the server to Personal Mode.
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) Navigator.of(context).popUntil((route) => route.isFirst);
+          });
+        }
+        if (mounted && (loading || next != frozen || error != null)) {
+          setState(() { frozen = next; loading = false; error = null; });
+        }
+      } finally { http.close(force: true); }
+    } catch (e) {
+      // Fail closed for all users if platform mode cannot be validated.
+      if (mounted) setState(() { loading = false; frozen = true; error = '$e'; });
+    }
+  }
+
+  @override
+  void dispose() {
+    monitor?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (!frozen) return AccountHomePage(key: ValueKey(widget.user.uid), user: widget.user);
+    return Scaffold(
+      appBar: AppBar(title: const Text('Sarmaya Plus / سرمایہ پلس')),
+      body: Center(child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480),
+        child: Padding(padding: const EdgeInsets.all(24), child: Column(
+          mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.lock_clock_outlined, size: 72, color: deepGreen),
+            const SizedBox(height: 20),
+            const Text('Account on Hold / اکاؤنٹ عارضی طور پر بند',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 12),
+            Text(error ?? 'Super Admin has enabled Personal Mode. Your account and records are safe. Access returns when Multi-User Mode is enabled.',
+              textAlign: TextAlign.center),
+            const SizedBox(height: 22),
+            FilledButton(onPressed: () => check(), child: const Text('Check Access / دوبارہ چیک کریں')),
+            TextButton(onPressed: () => FirebaseAuth.instance.signOut(),
+              child: const Text('Sign Out / لاگ آؤٹ')),
+          ],
+        )),
+      )),
+    );
+  }
+}
+
+class UnifiedModePage extends StatefulWidget {
+  const UnifiedModePage({super.key, required this.request});
+  final UnifiedRequest request;
+  @override
+  State<UnifiedModePage> createState() => _UnifiedModePageState();
+}
+
+class _UnifiedModePageState extends State<UnifiedModePage> {
+  String mode = 'PERSONAL';
+  bool loading = true;
+  bool busy = false;
+  String? error;
+  List<Map<String, dynamic>> history = [];
+
+  @override
+  void initState() { super.initState(); refresh(); }
+  Future<void> refresh() async {
+    setState(() { loading = true; error = null; });
+    try {
+      final result = await widget.request('GET','/v1/platform/mode');
+      if (!mounted) return;
+      setState(() {
+        mode = '${result['mode']}';
+        history = _unifiedMaps(result['history']);
+      });
+    } catch (e) { if (mounted) setState(() => error = '$e'); }
+    finally { if (mounted) setState(() => loading = false); }
+  }
+  Future<void> switchMode(String next) async {
+    if (next == mode || busy) return;
+    final accepted = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+      title: Text(next == 'PERSONAL' ? 'Enable Personal Mode?' : 'Enable Multi-User Mode?'),
+      content: Text(next == 'PERSONAL'
+        ? 'Other accounts will be frozen immediately. Their data will not be deleted. Only Super Admin keeps access.'
+        : 'Registered customers can log in and view ONLY their linked accounts. Your private ledgers remain hidden.'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Confirm Switch')),
+      ],
+    ));
+    if (accepted != true || !mounted) return;
+    setState(() => busy = true);
+    try {
+      await widget.request('POST','/v1/platform/mode',{
+        'mode': next, 'confirm': 'CONFIRM_MODE_CHANGE',
+      });
+      await refresh();
+    } catch (e) { if (mounted) setState(() => error = '$e'); }
+    finally { if (mounted) setState(() => busy = false); }
+  }
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Super Admin — Mode Control')),
+    body: RefreshIndicator(onRefresh: refresh, child: ListView(padding: const EdgeInsets.all(16),children: [
+      if (loading || busy) const LinearProgressIndicator(),
+      if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
+      Card(color: paleGreen,child: Padding(padding: const EdgeInsets.all(18),child: Column(children: [
+        const Icon(Icons.admin_panel_settings, size: 52, color: deepGreen),
+        const SizedBox(height: 12),
+        Text('Current Mode: $mode', style: const TextStyle(fontSize: 22,fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        Text(mode == 'PERSONAL'
+          ? 'Only Super Admin has access. Other customer logins are frozen.'
+          : 'Customer logins are enabled with private account access.'),
+      ]))),
+      const SizedBox(height: 12),
+      RadioListTile<String>(title: const Text('Personal Mode / ذاتی استعمال'),
+        subtitle: const Text('Keep customer records private and freeze other logins'),
+        value:'PERSONAL', groupValue:mode,
+        onChanged: busy || loading ? null : (v) { if (v != null) switchMode(v); }),
+      RadioListTile<String>(title: const Text('Multi-User Mode / تمام صارفین'),
+        subtitle: const Text('Give each customer access only to their own linked account'),
+        value:'MULTI', groupValue:mode,
+        onChanged: busy || loading ? null : (v) { if (v != null) switchMode(v); }),
+      const Divider(),
+      const Text('Mode Change History', style: TextStyle(fontSize:18,fontWeight:FontWeight.bold)),
+      ...history.map((h) => ListTile(
+        leading: const Icon(Icons.history),
+        title: Text('${h['old_mode']} → ${h['new_mode']}'),
+        subtitle: Text('${h['created_at'] ?? ''}'),
+      )),
+      const SizedBox(height: 12),
+      const Text('Switching mode never deletes profiles, balances, statements or KYC records. It does not initiate financial transfers.'),
+    ])),
+  );
+}
+
+List<Map<String, dynamic>> _unifiedMaps(dynamic raw) {
+  if (raw is! List) return [];
+  return raw.whereType<Map>().map((m) => Map<String, dynamic>.from(m)).toList();
+}
+
+class UnifiedCustomerPage extends StatefulWidget {
+  const UnifiedCustomerPage({super.key, required this.request,
+    required this.owner, required this.mode});
+  final UnifiedRequest request;
+  final bool owner;
+  final String mode;
+  @override
+  State<UnifiedCustomerPage> createState() => _UnifiedCustomerPageState();
+}
+
+class _UnifiedCustomerPageState extends State<UnifiedCustomerPage> {
+  bool loading = true;
+  bool busy = false;
+  String? error;
+  List<Map<String,dynamic>> clients = [];
+  List<Map<String,dynamic>> plans = [];
+  List<Map<String,dynamic>> investments = [];
+  List<Map<String,dynamic>> requests = [];
+  List<Map<String,dynamic>> tickets = [];
+  List<Map<String,dynamic>> periods = [];
+  Map<String,dynamic>? selected;
+  List<Map<String,dynamic>> entries = [];
+
+  @override
+  void initState(){super.initState(); refresh();}
+  Future<void> refresh() async {
+    if (!mounted) return;
+    setState(() { loading = true; error = null; });
+    try {
+      final results = await Future.wait([
+        widget.request('GET','/v1/clients'),
+        widget.request('GET','/v1/plans'),
+        widget.request('GET','/v1/investments'),
+        widget.request('GET','/v1/clients/requests'),
+        widget.request('GET','/v1/support'),
+        if(widget.owner) widget.request('GET','/v1/pnl'),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        clients = _unifiedMaps(results[0]['clients']);
+        plans = _unifiedMaps(results[1]['plans']);
+        investments = _unifiedMaps(results[2]['investments']);
+        requests = _unifiedMaps(results[3]['requests']);
+        tickets = _unifiedMaps(results[4]['tickets']);
+        if (widget.owner) periods = _unifiedMaps(results[5]['periods']);
+      });
+      if (selected != null) await loadLedger('${selected!['id']}');
+    } catch(e) { if(mounted) setState(() => error='$e'); }
+    finally { if(mounted) setState(() => loading=false); }
+  }
+  Future<void> loadLedger(String id) async {
+    try {
+      final result=await widget.request('GET','/v1/clients/ledger?client_id=$id');
+      if(mounted) setState(() {
+        selected = Map<String,dynamic>.from(result['client'] as Map);
+        entries = _unifiedMaps(result['entries']);
+      });
+    } catch(e) { alert('$e'); }
+  }
+  void alert(String message) {
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+  Future<void> perform(Future<void> Function() call) async {
+    if (busy) return;
+    setState(() { busy=true; error=null; });
+    try { await call(); await refresh(); alert('Saved / محفوظ ہوگیا'); }
+    catch(e) { alert('$e'); }
+    finally { if(mounted) setState(() => busy=false); }
+  }
+  // Text money avoids floating-point rounding errors in wallet bookkeeping.
+  int moneyValue(String input, String currency, {bool signed=false,bool allowZero=false}) {
+    final digits=currency=='USDT'?6:2;
+    final match=RegExp(r'^(-?)([0-9]{1,10})(?:\.([0-9]+))?$').firstMatch(input.trim());
+    if(match==null || (!signed && match.group(1)=='-')) throw const FormatException('Invalid amount');
+    final frac=match.group(3)??'';
+    if(frac.length>digits) throw FormatException('Max $digits decimal places');
+    final whole=int.parse(match.group(2)!);
+    final units=whole*(_power10(digits)) + int.parse(frac.padRight(digits,'0'));
+    if(units>1000000000000 || (!allowZero && units==0)) throw const FormatException('Amount out of range');
+    return match.group(1)=='-'?-units:units;
+  }
+  int _power10(int n){var v=1;for(var i=0;i<n;i++)v*=10;return v;}
+  String showMoney(dynamic raw,String currency) {
+    final value=(raw is num?raw.toInt():int.tryParse('$raw')??0);
+    final scale=_power10(currency=='USDT'?6:2);
+    final fraction=(value.abs()%scale).toString().padLeft(currency=='USDT'?6:2,'0');
+    final prefix=value<0?'-':'';
+    return '$prefix${value.abs()~/scale}.$fraction $currency';
+  }
+  String getClientName(String id) {
+    for(final c in clients) { if(c['id']==id) return '${c['full_name']}'; }
+    return id.substring(0,id.length>8?8:id.length);
+  }
+  Future<String?> textPrompt(String title, String label, {String initial=''}) async {
+    final ctrl=TextEditingController(text:initial);
+    try { return await showDialog<String>(context:context,builder:(ctx)=>AlertDialog(
+      title:Text(title),content:TextField(controller:ctrl,autofocus:true,
+      decoration:InputDecoration(labelText:label)),actions:[
+      TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),
+      FilledButton(onPressed:()=>Navigator.pop(ctx,ctrl.text.trim()),child:const Text('Save')),
+    ])); } finally {ctrl.dispose();}
+  }
+  Future<void> newClient() async {
+    final name=await textPrompt('New Customer / نیا کسٹمر','Full name');
+    if(name==null||name.length<2)return;
+    // Every person is a customer, regardless of family relationship or source of funds.
+    final currency=await choose('Currency',['PKR','AED','USDT']);
+    if(currency==null)return;
+    await perform(()async{await widget.request('POST','/v1/clients',{
+      'full_name':name,'relation':'customer','currency':currency,
+    });});
+  }
+  Future<String?> choose(String title,List<String> values) async =>
+    showDialog<String>(context:context,builder:(ctx)=>SimpleDialog(title:Text(title),children:values.map((v)=>
+      SimpleDialogOption(onPressed:()=>Navigator.pop(ctx,v),child:Padding(
+        padding:const EdgeInsets.symmetric(vertical:10),child:Text(v)))).toList()));
+  Future<void> linkClient(Map<String,dynamic> client) async {
+    final email=await textPrompt('Link verified login to ${client['full_name']}','Customer email');
+    if(email==null || !email.contains('@'))return;
+    await perform(()async{await widget.request('POST','/v1/clients/link',{
+      'client_id':client['id'],'email':email,
+    });});
+  }
+  Future<void> holdClient(Map<String,dynamic> client) async {
+    final next=client['status']=='active'?'hold':'active';
+    await perform(()async{await widget.request('POST','/v1/clients/hold',{
+      'client_id':client['id'],'status':next,
+    });});
+  }
+  Future<void> postEntry() async {
+    final c=selected;
+    if(c==null)return;
+    final kind=await choose('Manual Record',[
+      'capital_in','capital_out','profit','loss','fee','bonus','referral']);
+    if(kind==null)return;
+    final amount=await textPrompt('Amount / رقم','Amount in ${c['currency']}');
+    if(amount==null)return;
+    final note=await textPrompt('Private admin note','Optional description',initial:'Manual record');
+    if(note==null)return;
+    try {
+      var minor=moneyValue(amount,'${c['currency']}');
+      if(['capital_out','loss','fee'].contains(kind))minor=-minor;
+      final key='UI_${DateTime.now().microsecondsSinceEpoch}_${minor.abs()}';
+      await perform(()async{await widget.request('POST','/v1/clients/ledger',{
+        'client_id':c['id'],'kind':kind,'amount_minor':minor,'note':note,'request_id':key,
+      });});
+    }catch(e){alert('$e');}
+  }
+  Future<void> newRequest() async {
+    if(clients.isEmpty){alert('No linked customer accounts');return;}
+    final cid=await choose('Customer account',clients.map((c)=>'${c['id']}').toList());
+    if(cid==null)return;
+    final client=clients.firstWhere((e)=>e['id']==cid);
+    final kind=await choose('Request Type',['deposit','withdrawal','exit','question']);
+    if(kind==null)return;
+    final text=await textPrompt('Request amount','Amount in ${client['currency']}',initial:'0');
+    if(text==null)return;
+    final note=await textPrompt('Request details','Message',initial:'Please review this request');
+    if(note==null)return;
+    try {
+      final minor=moneyValue(text,'${client['currency']}',allowZero:true);
+      await perform(()async{await widget.request('POST','/v1/clients/requests',{
+        'client_id':cid,'kind':kind,'amount_minor':minor,'note':note,
+      });});
+    }catch(e){alert('$e');}
+  }
+  Future<void> reviewRequest(Map<String,dynamic> request) async {
+    final status=await choose('Change request status',['under_review','completed','rejected']);
+    if(status==null)return;
+    await perform(()async{await widget.request('POST','/v1/clients/requests/review',{
+      'request_id':request['request_id'],'status':status,
+    });});
+  }
+  Future<void> newPlan() async {
+    final title=await textPrompt('New Investment Plan','Title');if(title==null)return;
+    final currency=await choose('Currency',['PKR','AED','USDT']);if(currency==null)return;
+    final amount=await textPrompt('Minimum Investment','Minimum in $currency',initial:'1000');
+    if(amount==null)return;
+    final duration=await textPrompt('Duration','Days',initial:'30');if(duration==null)return;
+    try {
+      final min=moneyValue(amount,currency,allowZero:true);
+      final days=int.parse(duration);
+      await perform(()async{await widget.request('POST','/v1/plans',{
+        'title':title,'currency':currency,'min_amount_minor':min,'duration_days':days,
+      });});
+    }catch(e){alert('$e');}
+  }
+  Future<void> newInvestment() async {
+    if(clients.isEmpty||plans.isEmpty){alert('Create customer and plan first');return;}
+    final cid=await choose('Customer',clients.map((c)=>'${c['id']}').toList());
+    if(cid==null)return;
+    final c=clients.firstWhere((e)=>e['id']==cid);
+    final matching=plans.where((p)=>p['currency']==c['currency'] && p['enabled']==1).toList();
+    if(matching.isEmpty){alert('No matching plan');return;}
+    final planId=await choose('Plan',matching.map((x)=>'${x['plan_id']}').toList());
+    if(planId==null)return;
+    final amount=await textPrompt('Investment Principal','Amount in ${c['currency']}');
+    if(amount==null)return;
+    try {
+      final minor=moneyValue(amount,'${c['currency']}');
+      await perform(()async{await widget.request('POST','/v1/investments',{
+        'client_id':cid,'plan_id':planId,'principal_minor':minor,
+      });});
+    }catch(e){alert('$e');}
+  }
+  Future<void> closeInvestment(Map<String,dynamic> entry) async {
+    final accepted=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
+      title:const Text('Close investment record?'),
+      content:const Text('This closes the record only. No funds move automatically.'),
+      actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
+        FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Close'))]));
+    if(accepted!=true)return;
+    await perform(()async{await widget.request('POST','/v1/investments/close',{'id':entry['id']});});
+  }
+  Future<void> newPeriod() async {
+    final currency=await choose('Profit currency',['PKR','AED']);if(currency==null)return;
+    final amount=await textPrompt('Realized trading net P/L (signed)','e.g. 2500.00 or -100.00');
+    if(amount==null)return;
+    final note=await textPrompt('Period reference','Optional notes',initial:'Manual realized P/L record');
+    if(note==null)return;
+    try{
+      final net=moneyValue(amount,currency,signed:true,allowZero:true);
+      await perform(()async{await widget.request('POST','/v1/pnl',{
+        'currency':currency,'realized_net_minor':net,'note':note,
+      });});
+    }catch(e){alert('$e');}
+  }
+  Future<void> allocatePeriod(Map<String,dynamic> period) async {
+    final candidates=clients.where((c)=>c['currency']==period['currency']&&c['status']=='active').toList();
+    if(candidates.isEmpty){alert('No active customers in this currency');return;}
+    final cid=await choose('Client for profit credit',candidates.map((e)=>'${e['id']}').toList());
+    if(cid==null)return;
+    final input=await textPrompt('Profit credit','Amount in ${period['currency']}');
+    if(input==null)return;
+    try{
+      final amount=moneyValue(input,'${period['currency']}');
+      await perform(()async{await widget.request('POST','/v1/pnl/allocate',{
+        'client_id':cid,'period_id':period['period_id'],'amount_minor':amount,
+      });});
+    }catch(e){alert('$e');}
+  }
+  Future<void> autoDistribute(Map<String,dynamic> period) async {
+    final agreed = await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
+      title:const Text('Distribute verified customer profit?'),
+      content:const Text('The customer pool will be credited proportionately to current active investments. This updates the internal ledger only and does not transfer money.'),
+      actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
+        FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Distribute'))]));
+    if(agreed!=true)return;
+    await perform(()async{
+      await widget.request('POST','/v1/pnl/distribute',{'period_id':period['period_id']});
+    });
+  }
+  Future<void> copyCustomerBackup() async {
+    final agreed=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(
+      title:const Text('Copy private customer backup?'),
+      content:const Text('This copies account records to the phone clipboard. Keep the exported JSON private. Very large histories may be truncated.'),
+      actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancel')),
+        FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Copy'))]));
+    if(agreed!=true)return;
+    try {
+      final payload=await widget.request('GET','/v1/clients/export');
+      await Clipboard.setData(ClipboardData(text:const JsonEncoder.withIndent('  ').convert(payload)));
+      alert(payload['truncated']==true?'Partial backup copied: export limit reached':'Private JSON backup copied');
+    } catch(e){alert('$e');}
+  }
+  Future<void> newTicket() async {
+    final title=await textPrompt('Support Ticket','Subject');if(title==null)return;
+    final details=await textPrompt('Describe your issue','Message');if(details==null)return;
+    await perform(()async{await widget.request('POST','/v1/support',{'subject':title,'message':details});});
+  }
+  Future<void> resolveTicket(Map<String,dynamic> ticket) async {
+    await perform(()async{await widget.request('POST','/v1/support/resolve',{'ticket_id':ticket['ticket_id']});});
+  }
+  Widget intro(String text)=>Padding(padding:const EdgeInsets.fromLTRB(2,12,2,6),
+    child:Text(text,style:const TextStyle(fontSize:18,fontWeight:FontWeight.bold,color:deepGreen)));
+  Widget tip(String text)=>Card(child:Padding(padding:const EdgeInsets.all(13),child:Text(text)));
+  List<Widget> customersView()=>[
+    intro(widget.owner?'Customer Accounts / کسٹمر اکاؤنٹس':'My Private Account / میرا اکاؤنٹ'),
+    if(widget.owner)FilledButton.icon(onPressed:busy?null:newClient,
+      icon:const Icon(Icons.person_add_alt),label:const Text('Add Customer / نیا کسٹمر')),
+    if(widget.owner)OutlinedButton.icon(onPressed:busy?null:copyCustomerBackup,
+      icon:const Icon(Icons.copy_all_outlined),label:const Text('Copy Private JSON Backup')),
+    tip(widget.owner
+      ? 'Every person is treated as a customer, regardless of relationship or who supplied the money. Customers cannot see your internal accounting.'
+      : 'You can see only accounts that Super Admin explicitly linked to your login.'),
+    ...clients.map((c)=>Card(child:Column(children:[
+      ListTile(leading:const Icon(Icons.account_circle_outlined,color:deepGreen),
+        title:Text('${c['full_name']}'),
+        subtitle:Text('Customer • ${c['status']} • ${c['currency']}'),
+        trailing:const Icon(Icons.chevron_right),
+        onTap:()=>loadLedger('${c['id']}')),
+      Padding(padding:const EdgeInsets.fromLTRB(16,0,16,10),child:Align(
+        alignment:Alignment.centerLeft,child:Text('Recorded Balance: ${showMoney(c['balance_minor'],'${c['currency']}')}',
+          style:const TextStyle(fontWeight:FontWeight.bold)))),
+      if(widget.owner)Wrap(spacing:8,children:[
+        TextButton(onPressed:busy?null:()=>linkClient(c),child:const Text('Link Login')),
+        TextButton(onPressed:busy?null:()=>holdClient(c),child:Text(c['status']=='hold'?'Activate':'Hold')),
+      ]),
+    ]))),
+    if(clients.isEmpty)tip(widget.owner?'Add your first customer.':'No account linked yet.'),
+  ];
+  List<Widget> ledgerView()=>[
+    intro('Customer Statement / اکاؤنٹ اسٹیٹمنٹ'),
+    if(selected==null)tip('Tap any customer on Accounts tab to open its statement.'),
+    if(selected!=null)...[
+      Card(color:paleGreen,child:ListTile(title:Text('${selected!['full_name']}'),
+        subtitle:Text('${selected!['status']}'),
+        trailing:Text(showMoney(selected!['balance_minor'],'${selected!['currency']}')))),
+      if(widget.owner)FilledButton.icon(onPressed:busy?null:postEntry,icon:const Icon(Icons.add),
+        label:const Text('Add Manual Ledger Entry')),
+      ...entries.map((e)=>Card(child:ListTile(
+        title:Text('${e['kind']}'),subtitle:Text('${e['created_at']} ${e['note']??''}'),
+        trailing:Text(showMoney(e['amount_minor'],'${selected!['currency']}'))))),
+      if(entries.isEmpty)tip('No ledger entries yet.'),
+    ],
+    tip('All entries are manual financial records. No bank, wallet or blockchain transfers occur here.'),
+  ];
+  List<Widget> plansView()=>[
+    intro('Investment Plans / سرمایہ کاری پلان'),
+    if(widget.owner)FilledButton.icon(onPressed:busy?null:newPlan,
+      icon:const Icon(Icons.add),label:const Text('Create Plan')),
+    ...plans.map((p)=>Card(child:ListTile(
+      title:Text('${p['title']}'),
+      subtitle:Text('Min ${showMoney(p['min_amount_minor'],'${p['currency']}')} • ${p['duration_days']} days'),
+      trailing:Text(p['enabled']==1?'Active':'Disabled')))),
+    intro('Investment Records / سرمایہ کاری ریکارڈ'),
+    if(widget.owner)FilledButton.icon(onPressed:busy?null:newInvestment,
+      icon:const Icon(Icons.add_chart),label:const Text('Assign Investment')),
+    ...investments.map((i)=>Card(child:ListTile(
+      title:Text('${i['full_name']} — ${i['title']}'),
+      subtitle:Text('${i['status']} • ${i['started_at']}'),
+      trailing:widget.owner && i['status']=='active'
+        ?IconButton(icon:const Icon(Icons.check_circle_outline),tooltip:'Close record',
+           onPressed:busy?null:()=>closeInvestment(i))
+        :Text(showMoney(i['principal_minor'],'${i['currency']}'))))),
+    if(investments.isEmpty)tip('No investment records yet.'),
+    tip('No guaranteed return is shown. The owner records actual realized profit/loss separately.'),
+  ];
+  List<Widget> requestsView()=>[
+    intro('Deposit, Withdrawal & Exit Requests / درخواستیں'),
+    FilledButton.icon(onPressed:busy?null:newRequest,icon:const Icon(Icons.edit_note),
+      label:const Text('New Request / درخواست بھیجیں')),
+    ...requests.map((r)=>Card(child:ListTile(
+      title:Text('${r['full_name']} • ${r['kind']}'),
+      subtitle:Text('${r['status']} • ${r['created_at']}\n${r['note']??''}'),
+      trailing:widget.owner && ['submitted','under_review'].contains(r['status'])
+       ?IconButton(icon:const Icon(Icons.more_vert),onPressed:busy?null:()=>reviewRequest(r))
+       :Text(showMoney(r['amount_minor'],'${r['currency']}'))))),
+    tip('These are requests only. Marking completed does not send or receive money.'),
+  ];
+  List<Widget> pnlView()=>[
+    intro('Verified Realized P/L Journal / نفع و نقصان'),
+    FilledButton.icon(onPressed:busy?null:newPeriod,icon:const Icon(Icons.add_chart),
+      label:const Text('Record Period Result')),
+    tip('Allocation formula: 50% customer pool, 30% owner pool, 20% reserve/referrals. Earlier losses carry forward before profit is shared.'),
+    ...periods.map((p)=>Card(child:Padding(padding:const EdgeInsets.all(12),child:Column(
+      crossAxisAlignment:CrossAxisAlignment.start,children:[
+        Text('${p['created_at']} • ${p['currency']}',style:const TextStyle(fontWeight:FontWeight.bold)),
+        Text('Realized Net: ${showMoney(p['realized_net_minor'],'${p['currency']}')}'),
+        Text('Unrecovered Loss: ${showMoney(p['unrecovered_loss_minor'],'${p['currency']}')}'),
+        Text('Users 50%: ${showMoney(p['users_share_minor'],'${p['currency']}')}'),
+        Text('Owner 30%: ${showMoney(p['owner_share_minor'],'${p['currency']}')}'),
+        Text('Reserve 20%: ${showMoney(p['reserve_share_minor'],'${p['currency']}')}'),
+        Text('Already credited: ${showMoney(p['allocated_minor'],'${p['currency']}')}'),
+        if((p['users_share_minor'] as num).toInt()>0 && (p['allocated_minor'] as num).toInt()==0)
+          FilledButton.icon(onPressed:busy?null:()=>autoDistribute(p),
+            icon:const Icon(Icons.groups_2_outlined),
+            label:const Text('Distribute 50% Pool to All Active Clients')),
+        if((p['users_share_minor'] as num).toInt()>0)
+          TextButton(onPressed:busy?null:()=>allocatePeriod(p),
+            child:const Text('Allocate to One Client')),
+      ])))),
+    if(periods.isEmpty)tip('Record your first realized trading result.'),
+  ];
+  List<Widget> supportView()=>[
+    intro('Support & Messages / مدد'),
+    FilledButton.icon(onPressed:busy?null:newTicket,
+      icon:const Icon(Icons.support_agent),label:const Text('Open Support Ticket')),
+    ...tickets.map((t)=>Card(child:ListTile(
+      title:Text('${t['subject']}'),
+      subtitle:Text('${t['status']} • ${t['created_at']}\n${t['message']}'),
+      trailing:widget.owner && t['status']=='open' ? IconButton(
+        icon:const Icon(Icons.done),tooltip:'Resolve ticket',
+        onPressed:busy?null:()=>resolveTicket(t)) : null))),
+    if(tickets.isEmpty)tip('No support messages yet.'),
+  ];
+  @override
+  Widget build(BuildContext context) {
+    final tabs=widget.owner
+      ?const ['Customers','Statements','Plans','Requests','Profit','Support']
+      :const ['My Account','Statement','Plans','Requests','Support'];
+    final contents=widget.owner
+      ?<List<Widget>>[customersView(),ledgerView(),plansView(),requestsView(),pnlView(),supportView()]
+      :<List<Widget>>[customersView(),ledgerView(),plansView(),requestsView(),supportView()];
+    return DefaultTabController(length:tabs.length,child:Scaffold(
+      appBar:AppBar(title:Text(widget.owner?'Customer Management / کسٹمر اکاؤنٹس'
+        :'My Customer Dashboard / میرا اکاؤنٹ'),
+        actions:[IconButton(onPressed:loading?null:refresh,icon:const Icon(Icons.refresh))],
+        bottom:TabBar(isScrollable:true,tabAlignment:TabAlignment.start,
+          tabs:tabs.map((t)=>Tab(text:t)).toList())),
+      body:Column(children:[
+        if(loading||busy)const LinearProgressIndicator(minHeight:3),
+        if(error!=null)Padding(padding:const EdgeInsets.all(8),child:Text(error!,
+          style:const TextStyle(color:Colors.red))),
+        Expanded(child:TabBarView(children:contents.map((children)=>RefreshIndicator(
+          onRefresh:refresh,child:ListView(padding:const EdgeInsets.all(14),children:children))).toList())),
+      ]),
+    ));
+  }
 }
