@@ -13,7 +13,7 @@ import 'firebase_options.dart';
 typedef ApiRequest = Future<Map<String, dynamic>> Function(
     String method, String path, [Map<String, dynamic>? body]);
 
-// Sarmaya Plus — Account Dashboard v4: user + authorized admin KYC review
+// Sarmaya Plus — Account Dashboard v5: notifications, search, reports and reviewer roles
 // Firebase Email/Password + verified Cloudflare /v1/me profile.
 // No deposits, withdrawals, trading, investment or KYC document submission.
 const Color deepGreen = Color(0xFF123F2B);
@@ -409,6 +409,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
   bool kycSubmitting = false;
   bool kycAcknowledged = false;
   String? adminRole;
+  int unreadNotifications = 0;
   String? kycError;
   Map<String, dynamic>? kycRequest;
   final List<bool> readyChecklist = [false, false, false];
@@ -515,6 +516,13 @@ class _AccountHomePageState extends State<AccountHomePage> {
         });
       } catch (e) {
         if (mounted) setState(() => kycError = 'KYC request sync unavailable: $e');
+      }
+      try {
+        final notifications = await authenticatedRequest('GET', '/v1/notifications');
+        if (mounted) setState(() => unreadNotifications =
+            (notifications['unread'] as num?)?.toInt() ?? 0);
+      } catch (_) {
+        // Keep existing cloud profile available if notifications are temporarily offline.
       }
       // Ordinary accounts get no Admin button. A verified UID alone is insufficient.
       try {
@@ -794,6 +802,13 @@ class _AccountHomePageState extends State<AccountHomePage> {
         ),
       );
 
+  Future<void> _openNotifications() async {
+    await Navigator.push(context, MaterialPageRoute(
+      builder: (_) => NotificationsPage(request: authenticatedRequest),
+    ));
+    if (mounted) refreshProfile();
+  }
+
   List<Widget> _homeWidgets() => [
         const SizedBox(height: 10),
         Container(
@@ -828,6 +843,16 @@ class _AccountHomePageState extends State<AccountHomePage> {
             child: Text('Your Cloudflare profile is not available. Refresh to try again.'),
           )),
         Card(child: Column(children: [
+          ListTile(
+            leading: const Icon(Icons.notifications_outlined, color: deepGreen),
+            title: const Text('Notifications / اطلاعات'),
+            subtitle: Text(unreadNotifications == 0
+                ? 'KYC updates and account notices'
+                : '$unreadNotifications unread notification(s)'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _openNotifications,
+          ),
+          const Divider(height: 1),
           ListTile(
             leading: const Icon(Icons.person_outline, color: deepGreen),
             title: const Text('My Profile / میری پروفائل'),
@@ -1038,6 +1063,14 @@ class _AccountHomePageState extends State<AccountHomePage> {
         ],
         _sectionHeading('Account Settings / اکاؤنٹ سیٹنگز'),
         Card(child: Column(children: [
+          ListTile(
+            leading: const Icon(Icons.notifications_active_outlined, color: deepGreen),
+            title: const Text('My Notifications / میری اطلاعات'),
+            subtitle: Text('$unreadNotifications unread'),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: _openNotifications,
+          ),
+          const Divider(height: 1),
           SwitchListTile(
             secondary: const Icon(Icons.visibility_off_outlined, color: deepGreen),
             title: const Text('Hide email in this app'),
@@ -1078,7 +1111,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
-            'Sarmaya Plus • Account Dashboard v4\n'
+            'Sarmaya Plus • Account Dashboard v5\n'
             'Login: Firebase Authentication\n'
             'Account profile: Cloudflare API + D1\n'
             'KYC checklist and email-hide setting: stored on this device only\n\n'
@@ -1144,8 +1177,8 @@ class _AccountHomePageState extends State<AccountHomePage> {
 }
 
 
-// Admin features: no client-side role assignment, no identity approvals,
-// no account activations and no financial operations.
+// Admin functions are always authorized in Cloudflare, never by the app UI.
+// Role actions can ONLY grant/revoke reviewer access; existing admin role is protected.
 class AdminConsolePage extends StatefulWidget {
   const AdminConsolePage({super.key, required this.request});
   final ApiRequest request;
@@ -1155,14 +1188,26 @@ class AdminConsolePage extends StatefulWidget {
 }
 
 class _AdminConsolePageState extends State<AdminConsolePage> {
-  bool loading = true;
+  final searchController = TextEditingController();
+  bool loading = false;
+  bool changing = false;
   String? error;
   String? busyUid;
+  String role = '';
+  String search = '';
+  String filter = 'all';
   int section = 0;
+  int offset = 0;
+  int total = 0;
+  int pageSize = 20;
+  int reportDays = 30;
   Map<String, dynamic> metrics = {};
+  Map<String, dynamic> reports = {};
   List<Map<String, dynamic>> requests = [];
   List<Map<String, dynamic>> users = [];
   List<Map<String, dynamic>> events = [];
+  List<Map<String, dynamic>> roles = [];
+  List<Map<String, dynamic>> roleEvents = [];
 
   @override
   void initState() {
@@ -1170,44 +1215,110 @@ class _AdminConsolePageState extends State<AdminConsolePage> {
     refresh();
   }
 
-  List<Map<String, dynamic>> asRecords(dynamic items) {
-    if (items is! List) return [];
-    return items.whereType<Map>().map((item) => Map<String, dynamic>.from(item)).toList();
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
   }
 
+  List<Map<String, dynamic>> asRecords(dynamic items) {
+    if (items is! List) return [];
+    return items.whereType<Map>().map((row) => Map<String, dynamic>.from(row)).toList();
+  }
+
+  String textOf(dynamic value) => value?.toString() ?? '';
+  String pathWithQuery(String path, [Map<String, String> query = const {}]) =>
+      Uri(path: path, queryParameters: query).toString();
+
   Future<void> refresh() async {
-    if (!mounted) return;
+    if (!mounted || loading) return;
     setState(() { loading = true; error = null; });
     try {
       final overview = await widget.request('GET', '/v1/admin/overview');
-      final queue = await widget.request('GET', '/v1/admin/requests');
-      final people = await widget.request('GET', '/v1/admin/users');
-      final history = await widget.request('GET', '/v1/admin/audit');
+      final newRole = textOf(overview['role']);
+      final newMetrics = overview['metrics'] is Map
+          ? Map<String, dynamic>.from(overview['metrics'] as Map) : <String, dynamic>{};
+      var rows = <Map<String, dynamic>>[];
+      var newReports = <String, dynamic>{};
+      var newRoles = <Map<String, dynamic>>[];
+      var newCount = 0;
+      if (section == 0) {
+        final data = await widget.request('GET', pathWithQuery('/v1/admin/requests', {
+          'q': search, 'status': filter, 'offset': '$offset',
+        }));
+        rows = asRecords(data['requests']);
+        newCount = (data['total'] as num?)?.toInt() ?? rows.length;
+      } else if (section == 1) {
+        final data = await widget.request('GET', pathWithQuery('/v1/admin/users', {
+          'q': search, 'offset': '$offset',
+        }));
+        rows = asRecords(data['users']);
+        newCount = (data['total'] as num?)?.toInt() ?? rows.length;
+      } else if (section == 2) {
+        final data = await widget.request('GET', pathWithQuery('/v1/admin/audit', {
+          'offset': '$offset',
+        }));
+        rows = asRecords(data['events']);
+        newCount = (data['total'] as num?)?.toInt() ?? rows.length;
+      } else if (section == 3) {
+        newReports = await widget.request('GET', pathWithQuery('/v1/admin/reports', {
+          'days': '$reportDays',
+        }));
+      } else if (section == 4 && newRole == 'admin') {
+        final rolesResponse = await widget.request('GET', '/v1/admin/reviewers');
+        final history = await widget.request('GET', pathWithQuery('/v1/admin/role-audit', {
+          'offset': '$offset',
+        }));
+        newRoles = asRecords(rolesResponse['roles']);
+        rows = asRecords(history['events']);
+        newCount = (history['total'] as num?)?.toInt() ?? rows.length;
+      }
       if (!mounted) return;
       setState(() {
-        metrics = overview['metrics'] is Map
-            ? Map<String, dynamic>.from(overview['metrics'] as Map) : {};
-        requests = asRecords(queue['requests']);
-        users = asRecords(people['users']);
-        events = asRecords(history['events']);
+        role = newRole;
+        metrics = newMetrics;
+        total = newCount;
+        if (section == 0) requests = rows;
+        if (section == 1) users = rows;
+        if (section == 2) events = rows;
+        if (section == 3) reports = newReports;
+        if (section == 4) { roles = newRoles; roleEvents = rows; }
       });
     } catch (e) {
-      if (mounted) setState(() => error = 'Unable to load admin data: $e');
+      if (mounted) setState(() => error = 'Unable to load Admin data: $e');
     } finally {
       if (mounted) setState(() => loading = false);
     }
   }
 
-  String textOf(dynamic value) => value?.toString() ?? '';
-
-  List<String> allowedTransitions(String status) {
-    switch (status) {
-      case 'submitted': return ['under_review', 'needs_information', 'closed'];
-      case 'under_review': return ['needs_information', 'closed'];
-      case 'needs_information': return ['under_review', 'closed'];
-      default: return [];
-    }
+  void switchSection(int index) {
+    if (section == index || loading) return;
+    setState(() { section = index; offset = 0; total = 0; error = null; });
+    refresh();
   }
+
+  void findRecords() {
+    if (loading) return;
+    final next = searchController.text.trim();
+    if (next.length > 64) {
+      showMessage('Search must be 64 characters or fewer.');
+      return;
+    }
+    setState(() { search = next; offset = 0; });
+    refresh();
+  }
+
+  void showMessage(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  List<String> transitions(String state) => switch (state) {
+    'submitted' => ['under_review', 'needs_information', 'closed'],
+    'under_review' => ['needs_information', 'closed'],
+    'needs_information' => ['under_review', 'closed'],
+    _ => [],
+  };
 
   String statusTitle(String status) => switch (status) {
     'submitted' => 'Submitted / موصول',
@@ -1217,58 +1328,72 @@ class _AdminConsolePageState extends State<AdminConsolePage> {
     _ => status,
   };
 
-  Future<void> changeStatus(Map<String, dynamic> row, String next) async {
-    if (busyUid != null) return;
-    final uid = textOf(row['firebase_uid']);
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Change review status?'),
-        content: Text(
-          '${textOf(row['display_name'])}\n'
-          '${statusTitle(textOf(row['status']))} → ${statusTitle(next)}\n\n'
-          'This is ONLY a review workflow update. It does not verify identity, '
-          'activate an account or authorize any financial service.',
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(dialogContext, false),
-              child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(dialogContext, true),
-              child: const Text('Confirm')),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    setState(() => busyUid = uid);
-    try {
-      await widget.request('POST', '/v1/admin/request-status', {
-        'firebase_uid': uid,
-        'status': next,
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Review status saved in Cloudflare and recorded in audit history.'),
+  Future<bool> confirm(String title, String detail) async {
+    final yes = await showDialog<bool>(context: context,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(title), content: Text(detail),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(dialogContext, false),
+                child: const Text('Cancel')),
+            FilledButton(onPressed: () => Navigator.pop(dialogContext, true),
+                child: const Text('Confirm')),
+          ],
         ));
-      }
-      await refresh();
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Update not saved: $e')));
-    } finally {
-      if (mounted) setState(() => busyUid = null);
-    }
+    return yes == true;
   }
 
-  Widget metric(String label, dynamic count, IconData icon) => SizedBox(
+  Future<void> changeStatus(Map<String, dynamic> row, String next) async {
+    if (changing || loading) return;
+    final uid = textOf(row['firebase_uid']);
+    if (!await confirm('Change review status?',
+        '${textOf(row['display_name'])}\n'
+        '${statusTitle(textOf(row['status']))} → ${statusTitle(next)}\n\n'
+        'Review status only. Identity stays unverified; no financial access is enabled.')) return;
+    if (!mounted) return;
+    setState(() { changing = true; busyUid = uid; });
+    try {
+      await widget.request('POST', '/v1/admin/request-status', {
+        'firebase_uid': uid, 'status': next,
+      });
+      showMessage('Review saved. Audit entry and user notification created.');
+    } catch (e) {
+      showMessage('Review was not saved: $e');
+    } finally {
+      if (mounted) setState(() { changing = false; busyUid = null; });
+    }
+    await refresh();
+  }
+
+  Future<void> changeReviewer(Map<String, dynamic> row, bool enable) async {
+    if (role != 'admin' || changing || loading) return;
+    final uid = textOf(row['firebase_uid']);
+    final name = textOf(row['display_name']);
+    final action = enable ? 'Grant reviewer access' : 'Disable reviewer access';
+    if (!await confirm(action, '$name\n\nReviewer access allows limited KYC review.'
+        ' It does not approve identity or enable money transactions.')) return;
+    if (!mounted) return;
+    setState(() { changing = true; busyUid = uid; });
+    try {
+      await widget.request('POST', '/v1/admin/reviewer-role', {
+        'firebase_uid': uid, 'enabled': enable,
+      });
+      showMessage('Reviewer access updated and recorded in audit history.');
+    } catch (e) {
+      showMessage('Role was not changed: $e');
+    } finally {
+      if (mounted) setState(() { changing = false; busyUid = null; });
+    }
+    await refresh();
+  }
+
+  Widget metric(String label, dynamic n, IconData icon) => SizedBox(
     width: 155,
-    child: Card(
-      color: paleGreen,
-      child: Padding(
-        padding: const EdgeInsets.all(14),
+    child: Card(color: paleGreen,
+      child: Padding(padding: const EdgeInsets.all(14),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           Icon(icon, color: deepGreen),
           const SizedBox(height: 8),
-          Text(textOf(count).isEmpty ? '0' : textOf(count),
+          Text(textOf(n).isEmpty ? '0' : textOf(n),
               style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 24)),
           Text(label, style: const TextStyle(fontSize: 12)),
         ]),
@@ -1277,122 +1402,310 @@ class _AdminConsolePageState extends State<AdminConsolePage> {
   );
 
   Widget requestCard(Map<String, dynamic> row) {
-    final status = textOf(row['status']);
-    final choices = allowedTransitions(status);
-    final uid = textOf(row['firebase_uid']);
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 7),
-        child: ListTile(
-          title: Text(textOf(row['display_name']),
-              style: const TextStyle(fontWeight: FontWeight.bold)),
-          subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(textOf(row['email'])),
-            const SizedBox(height: 5),
-            Text(statusTitle(status), style: const TextStyle(color: deepGreen)),
-            Text('Requested (UTC): ${textOf(row['created_at'])}',
-                style: const TextStyle(fontSize: 12)),
-          ]),
-          trailing: choices.isEmpty ? const Icon(Icons.check_circle_outline) :
-              PopupMenuButton<String>(
-                tooltip: 'Review actions',
-                enabled: busyUid == null,
-                onSelected: (value) => changeStatus(row, value),
-                itemBuilder: (_) => choices.map((statusValue) => PopupMenuItem<String>(
-                  value: statusValue,
-                  child: Text(statusTitle(statusValue)),
-                )).toList(),
-              ),
-          onLongPress: () async {
-            await Clipboard.setData(ClipboardData(text: uid));
-            if (mounted) ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Account ID copied. Keep private.')),
-            );
-          },
-        ),
-      ),
-    );
+    final state = textOf(row['status']);
+    final choices = transitions(state);
+    return Card(child: ListTile(
+      title: Text(textOf(row['display_name']),
+          style: const TextStyle(fontWeight: FontWeight.bold)),
+      subtitle: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text(textOf(row['email'])),
+        Text(statusTitle(state), style: const TextStyle(color: deepGreen)),
+        Text('Submitted UTC: ${textOf(row['created_at'])}',
+            style: const TextStyle(fontSize: 12)),
+      ]),
+      trailing: choices.isEmpty ? const Icon(Icons.check_circle_outline) :
+          PopupMenuButton<String>(
+            enabled: !changing && !loading,
+            tooltip: 'Change review status',
+            onSelected: (value) => changeStatus(row, value),
+            itemBuilder: (_) => choices.map((value) => PopupMenuItem<String>(
+              value: value, child: Text(statusTitle(value)),
+            )).toList(),
+          ),
+      onLongPress: () async {
+        await Clipboard.setData(ClipboardData(text: textOf(row['firebase_uid'])));
+        showMessage('Account ID copied. Treat it as private.');
+      },
+    ));
   }
 
-  Widget userCard(Map<String, dynamic> row) => Card(
-    child: ListTile(
-      leading: const Icon(Icons.person_outline, color: deepGreen),
-      title: Text(textOf(row['display_name'])),
-      subtitle: Text(
-          '${textOf(row['email'])}\nAccount: ${textOf(row['status'])}\n'
-          'Review: ${row['kyc_request_status'] == null ? 'Not requested' : textOf(row['kyc_request_status'])}'),
-      isThreeLine: true,
-    ),
-  );
+  Widget userCard(Map<String, dynamic> row) {
+    final uid = textOf(row['firebase_uid']);
+    final adminRole = textOf(row['admin_role']);
+    final reviewerOn = adminRole == 'reviewer' && (row['admin_enabled'] as num?) == 1;
+    final isSelf = FirebaseAuth.instance.currentUser?.uid == uid;
+    return Card(child: Padding(padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Column(children: [
+        ListTile(
+          leading: const Icon(Icons.person_outline, color: deepGreen),
+          title: Text(textOf(row['display_name'])),
+          subtitle: Text('${textOf(row['email'])}\n'
+              'Account: ${textOf(row['status'])}\n'
+              'KYC: ${textOf(row['kyc_request_status']).isEmpty ? 'Not requested' : textOf(row['kyc_request_status'])}\n'
+              'Role: ${adminRole.isEmpty ? 'User' : (reviewerOn || adminRole == 'admin' ? adminRole : 'Reviewer disabled')}'),
+        ),
+        if (role == 'admin' && adminRole != 'admin' && !isSelf)
+          Padding(padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
+            child: OutlinedButton.icon(
+              onPressed: changing ? null : () => changeReviewer(row, !reviewerOn),
+              icon: Icon(reviewerOn ? Icons.person_remove_outlined : Icons.person_add_alt_1_outlined),
+              label: Text(reviewerOn ? 'Disable reviewer' : 'Grant reviewer'),
+            ),
+          ),
+      ]),
+    ));
+  }
 
-  Widget auditCard(Map<String, dynamic> row) => Card(
-    child: ListTile(
-      leading: const Icon(Icons.history, color: deepGreen),
-      title: Text('${textOf(row['old_status'])} → ${textOf(row['new_status'])}'),
-      subtitle: Text(
-        'Reviewer: ${textOf(row['actor_name']).isEmpty ? textOf(row['actor_uid']) : textOf(row['actor_name'])}\n'
-        'Account: ${textOf(row['target_uid'])}\nUTC: ${textOf(row['created_at'])}',
-      ),
-    ),
-  );
+  Widget auditCard(Map<String, dynamic> row) => Card(child: ListTile(
+    leading: const Icon(Icons.history, color: deepGreen),
+    title: Text('${textOf(row['old_status'])} → ${textOf(row['new_status'])}'),
+    subtitle: Text('Reviewer: ${textOf(row['actor_name']).isEmpty ? textOf(row['actor_uid']) : textOf(row['actor_name'])}\n'
+        'Account: ${textOf(row['target_uid'])}\nUTC: ${textOf(row['created_at'])}'),
+  ));
+
+  Widget roleAuditCard(Map<String, dynamic> row) => Card(child: ListTile(
+    leading: const Icon(Icons.manage_accounts_outlined, color: deepGreen),
+    title: Text('${textOf(row['old_role']).isEmpty ? 'User' : textOf(row['old_role'])} → '
+        '${textOf(row['new_enabled']) == '1' ? 'Active reviewer' : 'Reviewer disabled'}'),
+    subtitle: Text('Account: ${textOf(row['target_uid'])}\n'
+        'Changed by: ${textOf(row['actor_name'])}\nUTC: ${textOf(row['created_at'])}'),
+  ));
+
+  Widget paging() {
+    if (section == 3 || loading) return const SizedBox.shrink();
+    final first = total == 0 ? 0 : offset + 1;
+    final last = total < offset + pageSize ? total : offset + pageSize;
+    return Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+      Text('Showing $first–$last of $total', style: const TextStyle(fontSize: 12)),
+      Row(mainAxisSize: MainAxisSize.min, children: [
+        IconButton(tooltip: 'Previous page', icon: const Icon(Icons.chevron_left),
+          onPressed: offset == 0 ? null : () {
+            setState(() => offset -= pageSize);
+            refresh();
+          }),
+        IconButton(tooltip: 'Next page', icon: const Icon(Icons.chevron_right),
+          onPressed: offset + pageSize >= total ? null : () {
+            setState(() => offset += pageSize);
+            refresh();
+          }),
+      ]),
+    ]);
+  }
+
+  Widget reportWidgets() {
+    final statuses = asRecords(reports['request_status']);
+    final days = asRecords(reports['daily_requests']);
+    final activeRoles = asRecords(reports['active_roles']);
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Wrap(spacing: 8, children: [7, 30, 90].map((value) => ChoiceChip(
+        label: Text('$value days'), selected: reportDays == value,
+        onSelected: (_) { setState(() => reportDays = value); refresh(); },
+      )).toList()),
+      const SizedBox(height: 12),
+      Card(child: Padding(padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Operational activity (not a financial report)',
+              style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 10),
+          Text('KYC review changes: ${textOf(reports['review_changes'])}'),
+          Text('Reviewer role changes: ${textOf(reports['role_changes'])}'),
+          const SizedBox(height: 9),
+          ...statuses.map((row) => Text('${statusTitle(textOf(row['status']))}: ${textOf(row['n'])}')),
+          const SizedBox(height: 9),
+          ...activeRoles.map((row) => Text('Active ${textOf(row['role'])}: ${textOf(row['n'])}')),
+        ]),
+      )),
+      const SizedBox(height: 12),
+      const Text('KYC requests created by day (UTC)', style: TextStyle(fontWeight: FontWeight.bold)),
+      if (days.isEmpty) const Text('No requests for this period'),
+      ...days.map((row) => Card(child: ListTile(
+        leading: const Icon(Icons.calendar_today_outlined, color: deepGreen),
+        title: Text(textOf(row['day'])),
+        trailing: Text(textOf(row['submitted'])),
+      ))),
+      const SizedBox(height: 12),
+      const Text('No investment, payments or profits are processed or reported by this version.',
+          style: TextStyle(fontSize: 12, color: Colors.black54)),
+    ]);
+  }
+
+  Widget roleWidgets() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    const Text('Active roles / Administrative access',
+        style: TextStyle(fontWeight: FontWeight.bold, color: deepGreen)),
+    const SizedBox(height: 5),
+    const Text('Only the existing Admin can grant or disable Reviewer access using the Users tab. '
+        'Admin ownership cannot be granted or removed in the app.',
+        style: TextStyle(fontSize: 12)),
+    ...roles.map((row) => Card(child: ListTile(
+      leading: const Icon(Icons.shield_outlined, color: deepGreen),
+      title: Text(textOf(row['display_name'])),
+      subtitle: Text('${textOf(row['email'])}\n${textOf(row['role'])} • '
+          '${textOf(row['enabled']) == '1' ? 'Enabled' : 'Disabled'}'),
+    ))),
+    const SizedBox(height: 12),
+    const Text('Role audit history', style: TextStyle(fontWeight: FontWeight.bold, color: deepGreen)),
+    ...roleEvents.map(roleAuditCard),
+  ]);
 
   @override
   Widget build(BuildContext context) {
-    final records = section == 0 ? requests : section == 1 ? users : events;
+    final rows = section == 0 ? requests : section == 1 ? users :
+        section == 2 ? events : roleEvents;
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Admin Console / ایڈمن'),
-        actions: [
-          IconButton(onPressed: loading ? null : refresh,
-              icon: const Icon(Icons.refresh), tooltip: 'Refresh'),
-        ],
-      ),
-      body: RefreshIndicator(
-        onRefresh: refresh,
+      appBar: AppBar(title: const Text('Admin Console / ایڈمن'), actions: [
+        IconButton(icon: const Icon(Icons.refresh), tooltip: 'Refresh',
+          onPressed: loading ? null : refresh),
+      ]),
+      body: RefreshIndicator(onRefresh: refresh,
         child: ListView(padding: const EdgeInsets.all(14), children: [
-          const Text('Verified Firebase admin access — server enforced',
-            style: TextStyle(color: Colors.black54, fontSize: 12)),
-          const SizedBox(height: 12),
+          Text('Firebase admin access • ${role.isEmpty ? 'Checking...' : role}',
+              style: const TextStyle(color: Colors.black54, fontSize: 12)),
+          const SizedBox(height: 10),
           Wrap(spacing: 7, runSpacing: 7, children: [
-            metric('Registered users', metrics['users'], Icons.people_outline),
+            metric('Users', metrics['users'], Icons.people_outline),
             metric('KYC requests', metrics['requests'], Icons.badge_outlined),
-            metric('New / submitted', metrics['submitted'], Icons.inbox_outlined),
+            metric('New', metrics['submitted'], Icons.inbox_outlined),
             metric('Under review', metrics['under_review'], Icons.fact_check_outlined),
           ]),
-          const SizedBox(height: 12),
-          const Card(child: Padding(padding: EdgeInsets.all(12), child: Text(
-            'Admin actions change ONLY the review request status. '
-            'KYC remains pending. No identity document verification, '
-            'account activation or financial operation is available.',
-            style: TextStyle(fontSize: 12),
-          ))),
-          const SizedBox(height: 6),
-          Wrap(spacing: 8, children: [
-            ChoiceChip(label: const Text('Review queue'), selected: section == 0,
-                onSelected: (_) => setState(() => section = 0)),
+          const Card(child: Padding(padding: EdgeInsets.all(12),
+            child: Text('Review workflow only. No identity approvals, account activation, '
+                'document uploads, deposits, withdrawals or investments.',
+              style: TextStyle(fontSize: 12)))),
+          Wrap(spacing: 6, runSpacing: 4, children: [
+            ChoiceChip(label: const Text('KYC queue'), selected: section == 0,
+              onSelected: (_) => switchSection(0)),
             ChoiceChip(label: const Text('Users'), selected: section == 1,
-                onSelected: (_) => setState(() => section = 1)),
-            ChoiceChip(label: const Text('Audit history'), selected: section == 2,
-                onSelected: (_) => setState(() => section = 2)),
+              onSelected: (_) => switchSection(1)),
+            ChoiceChip(label: const Text('KYC audit'), selected: section == 2,
+              onSelected: (_) => switchSection(2)),
+            ChoiceChip(label: const Text('Reports'), selected: section == 3,
+              onSelected: (_) => switchSection(3)),
+            if (role == 'admin') ChoiceChip(label: const Text('Roles'),
+              selected: section == 4, onSelected: (_) => switchSection(4)),
           ]),
-          const SizedBox(height: 12),
+          if (section == 0 || section == 1) ...[
+            const SizedBox(height: 10),
+            TextField(controller: searchController,
+              textInputAction: TextInputAction.search,
+              onSubmitted: (_) => findRecords(),
+              decoration: InputDecoration(
+                labelText: 'Search name / email / account ID',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: IconButton(tooltip: 'Search', icon: const Icon(Icons.arrow_forward),
+                  onPressed: findRecords),
+              ),
+            ),
+            if (section == 0) Padding(padding: const EdgeInsets.only(top: 7),
+              child: Wrap(spacing: 6, children: ['all','submitted','under_review',
+                'needs_information','closed'].map((value) => ChoiceChip(
+                  label: Text(value.replaceAll('_', ' ')), selected: filter == value,
+                  onSelected: (_) { setState(() { filter = value; offset = 0; }); refresh(); },
+                )).toList()),
+            ),
+          ],
+          const SizedBox(height: 10),
           if (loading) const LinearProgressIndicator(),
-          if (error != null) Card(child: Padding(
-            padding: const EdgeInsets.all(14),
-            child: Text(error!, style: const TextStyle(color: Colors.red)),
-          )),
-          if (!loading && error == null && records.isEmpty)
-            const Card(child: Padding(padding: EdgeInsets.all(18),
-                child: Text('No records to show.'))),
-          if (error == null) ...records.map((row) => section == 0
-              ? requestCard(row)
-              : section == 1 ? userCard(row) : auditCard(row)),
-          const SizedBox(height: 25),
-          const Text('Showing up to 40 most recent records per section. '
-              'Detailed search and pagination will require another version.',
-              style: TextStyle(fontSize: 11, color: Colors.black54)),
+          if (error != null) Card(child: Padding(padding: const EdgeInsets.all(14),
+            child: Text(error!, style: const TextStyle(color: Colors.red)))),
+          if (!loading && error == null) ...[
+            if (section == 3) reportWidgets()
+            else if (section == 4) roleWidgets()
+            else ...[
+              if (rows.isEmpty) const Card(child: Padding(padding: EdgeInsets.all(14),
+                  child: Text('No records in this section.'))),
+              ...rows.map((row) => section == 0 ? requestCard(row) :
+                  section == 1 ? userCard(row) : auditCard(row)),
+            ],
+            if (section != 3) paging(),
+          ],
         ]),
       ),
     );
   }
+}
+
+// Read-only, account-scoped notices. Only the server can create notifications.
+class NotificationsPage extends StatefulWidget {
+  const NotificationsPage({super.key, required this.request});
+  final ApiRequest request;
+  @override
+  State<NotificationsPage> createState() => _NotificationsPageState();
+}
+
+class _NotificationsPageState extends State<NotificationsPage> {
+  bool loading = false;
+  String? error;
+  List<Map<String, dynamic>> items = [];
+  int unread = 0;
+
+  @override
+  void initState() { super.initState(); refresh(); }
+
+  Future<void> refresh() async {
+    if (loading) return;
+    setState(() { loading = true; error = null; });
+    try {
+      final result = await widget.request('GET', '/v1/notifications');
+      final list = result['notifications'];
+      if (!mounted) return;
+      setState(() {
+        items = list is List ? list.whereType<Map>()
+            .map((item) => Map<String, dynamic>.from(item)).toList() : [];
+        unread = (result['unread'] as num?)?.toInt() ?? 0;
+      });
+    } catch (e) {
+      if (mounted) setState(() => error = '$e');
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> markRead(Map<String, dynamic> row) async {
+    if (row['read_at'] != null) return;
+    final id = row['id'];
+    if (id is! int) return;
+    try {
+      await widget.request('POST', '/v1/notifications/read', {'id': id});
+      await refresh();
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Unable to mark as read: $e')),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Notifications / اطلاعات'), actions: [
+      IconButton(icon: const Icon(Icons.refresh), tooltip: 'Refresh',
+        onPressed: loading ? null : refresh),
+    ]),
+    body: RefreshIndicator(onRefresh: refresh,
+      child: ListView(padding: const EdgeInsets.all(16), children: [
+        Text('Unread: $unread', style: const TextStyle(color: deepGreen,
+            fontWeight: FontWeight.bold)),
+        if (loading) const LinearProgressIndicator(),
+        if (error != null) Card(child: Padding(padding: const EdgeInsets.all(14),
+            child: Text(error!, style: const TextStyle(color: Colors.red)))),
+        if (!loading && error == null && items.isEmpty)
+          const Card(child: Padding(padding: EdgeInsets.all(16),
+            child: Text('No notifications yet. Review updates will appear here.'))),
+        ...items.map((row) => Card(
+          color: row['read_at'] == null ? paleGreen : null,
+          child: ListTile(
+            leading: Icon(row['read_at'] == null ? Icons.markunread_outlined
+                : Icons.mark_email_read_outlined, color: deepGreen),
+            title: Text('${row['title'] ?? ''}',
+                style: const TextStyle(fontWeight: FontWeight.w600)),
+            subtitle: Text('${row['message'] ?? ''}\n${row['created_at'] ?? ''} UTC'),
+            trailing: row['read_at'] == null
+                ? IconButton(tooltip: 'Mark as read',
+                    onPressed: () => markRead(row), icon: const Icon(Icons.done))
+                : null,
+            onTap: () => markRead(row),
+          ),
+        )),
+      ]),
+    ),
+  );
 }
