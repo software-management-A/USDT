@@ -11,6 +11,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'firebase_options.dart';
 import 'remittance_v10.dart';
+import 'v11_features.dart';
+import 'package:android_id/android_id.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 
 // Only the authenticated Cloudflare backend grants admin access.
 typedef ApiRequest = Future<Map<String, dynamic>> Function(
@@ -61,6 +64,15 @@ class SarmayaPlusApp extends StatelessWidget {
               minimumSize: const Size(0, 48),
             ),
           ),
+        ),
+        builder: (context, navigator) => StreamBuilder<User?>(
+          stream: FirebaseAuth.instance.authStateChanges(),
+          builder: (context, snapshot) {
+            final user = snapshot.data;
+            if (user == null) return navigator ?? const SizedBox.shrink();
+            return V11SessionGate(key: ValueKey('v11_${user.uid}'),
+                user: user, child: navigator ?? const SizedBox.shrink());
+          },
         ),
         home: const AuthGate(),
       );
@@ -173,9 +185,14 @@ class _AccountPageState extends State<AccountPage> {
           password: p,
         );
         final user = credential.user!;
+        final deviceId = await const AndroidId().getId();
+        if (deviceId == null || !RegExp(r'^[0-9a-fA-F]{16}$').hasMatch(deviceId)) {
+          throw StateError('Device registration ID unavailable. Account setup cannot finish.');
+        }
         final prefs = await SharedPreferences.getInstance();
         await prefs.setString('registration_${user.uid}', jsonEncode({
           'name': displayName.text.trim(),
+          'device_id': deviceId,
           'referral_code': referral.text.trim().toUpperCase(),
           'terms_version': termsVersion,
           'risk_version': riskVersion,
@@ -471,6 +488,8 @@ class _AccountHomePageState extends State<AccountHomePage> {
           .openUrl(method, Uri.parse('$apiBase$path'))
           .timeout(const Duration(seconds: 15));
       request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+      final appInfo = await PackageInfo.fromPlatform();
+      request.headers.set('X-Sarmaya-Build', appInfo.buildNumber);
       request.headers.set(HttpHeaders.acceptHeader, 'application/json');
       if (body != null) {
         request.headers.contentType = ContentType.json;
@@ -866,6 +885,12 @@ class _AccountHomePageState extends State<AccountHomePage> {
     if (mounted) refreshProfile();
   }
 
+  Future<void> _openV11() async {
+    await Navigator.push(context, MaterialPageRoute(builder: (_) =>
+      V11HubPage(request: authenticatedRequest, owner: unifiedOwner)));
+    if (mounted) refreshProfile();
+  }
+
   Future<void> _openTransferAdmin() async {
     await Navigator.push(context, MaterialPageRoute(
       builder: (_) => TransferAdminPage(
@@ -926,6 +951,12 @@ class _AccountHomePageState extends State<AccountHomePage> {
           title: const Text('3. AED to PKR'),
           subtitle: const Text('Published Rate • Calculator • Sender • Receiver • Orders'),
           trailing: const Icon(Icons.chevron_right), onTap: _openTransferCustomer,
+        )),
+        Card(color: paleGreen, child: ListTile(
+          leading: const Icon(Icons.auto_awesome, color: deepGreen),
+          title: const Text('Sarmaya Plus v11 — Final Tools'),
+          subtitle: const Text('Multi-Lot Sales • Records • Plans • Reports • Backups'),
+          trailing: const Icon(Icons.chevron_right), onTap: _openV11,
         )),
         _sectionHeading('Account Overview / اکاؤنٹ خلاصہ'),
         if (profile != null) _statusBanner(),
@@ -1247,7 +1278,7 @@ class _AccountHomePageState extends State<AccountHomePage> {
         const Card(child: Padding(
           padding: EdgeInsets.all(16),
           child: Text(
-            'Sarmaya Plus • Unified Edition v10\n'
+            'Sarmaya Plus • Unified Edition v11\n'
             'Login: Firebase Authentication\n'
             'Account profile: Cloudflare API + D1\n'
             'KYC checklist and email-hide setting: stored on this device only\n\n'
@@ -2327,6 +2358,8 @@ class _UnifiedAccessGateState extends State<UnifiedAccessGate>
       try {
         final req = await http.getUrl(Uri.parse('$apiBase/v1/platform/status'));
         req.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
+        final appInfo = await PackageInfo.fromPlatform();
+        req.headers.set('X-Sarmaya-Build', appInfo.buildNumber);
         final response = await req.close().timeout(const Duration(seconds: 15));
         final value = jsonDecode(await utf8.decoder.bind(response).join());
         if (response.statusCode != 200 || value is! Map<String, dynamic>) {
@@ -2852,6 +2885,8 @@ class _UnifiedCustomerPageState extends State<UnifiedCustomerPage> {
         trailing:Text(showMoney(selected!['balance_minor'],'${selected!['currency']}')))),
       if(widget.owner)FilledButton.icon(onPressed:busy?null:postEntry,icon:const Icon(Icons.add),
         label:const Text('Add Manual Ledger Entry')),
+      OutlinedButton.icon(onPressed:()=>v11ShareCustomerStatementPdf(selected!,entries),
+        icon:const Icon(Icons.picture_as_pdf),label:const Text('Share PDF Statement')),
       ...entries.map((e)=>Card(child:ListTile(
         title:Text('${e['kind']}'),subtitle:Text('${e['created_at']} ${e['note']??''}'),
         trailing:Text(showMoney(e['amount_minor'],'${selected!['currency']}'))))),
