@@ -1,3 +1,4 @@
+import 'v11_features.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -284,6 +285,10 @@ class _TransferCustomerPageState extends State<TransferCustomerPage> {
             subtitle: Text('${h['created_at']}  ${h['note'] ?? ''}'),
           )).toList())),
         actions: [
+          TextButton(onPressed: () async {
+            Navigator.pop(ctx);
+            try{await v11ShareOrderPdf(order);}catch(e){info('PDF failed: $e');}
+          },child:const Text('PDF Receipt')),
           TextButton(onPressed: () async {
             await Clipboard.setData(ClipboardData(text:orderReceipt(order)));
             if(ctx.mounted)Navigator.pop(ctx);
@@ -581,6 +586,14 @@ class _TransferAdminPageState extends State<TransferAdminPage> {
     const Text('All 4 combinations: AED→AED, AED→PKR, PKR→AED, PKR→PKR. Choose buy and sell currencies independently.'),
     const SizedBox(height:10),
     FilledButton.icon(onPressed:busy?null:buyUsdt,icon:const Icon(Icons.add),label:const Text('Record New USDT Purchase')),
+    Card(color:v9Light,child:ListTile(
+      leading:const Icon(Icons.layers,color:v9Green),
+      title:const Text('v11 — Multi-Lot Selling / Combined Inventory'),
+      subtitle:const Text('Select USDT quantities from multiple purchases in one sale'),
+      trailing:const Icon(Icons.chevron_right),
+      onTap:()=>Navigator.push(context,MaterialPageRoute(
+        builder:(_)=>V11TradingPage(request:widget.request))),
+    )),
     section('USDT Buy Lots / Remaining Inventory'),
     ...lots.map((lot)=>Card(child:Column(children:[
       ListTile(title:Text('Bought: ${_v9Money(lot['bought_usdt_micros'],'USDT')}'),
