@@ -16,7 +16,7 @@ jobs:
           ref: main
           persist-credentials: true
 
-      - name: Restore Sign Up switch without removing existing code
+      - name: Add Sign Up switch safely
         shell: bash
         run: |
           python3 - <<'PY'
@@ -24,58 +24,55 @@ jobs:
 
           path = Path('lib/auth_entry.dart')
           source = path.read_text(encoding='utf-8')
+
           if not source.startswith("import 'dart:async';") or len(source) < 100000:
-              raise SystemExit('Unexpected or incomplete Dart file; no changes made')
-          if 'class _AccountPageState' not in source:
-              raise SystemExit('Login screen not found; no changes made')
+              raise SystemExit('Unexpected or incomplete Dart file; no changes made.')
 
-          old = '''                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text('Personal owner-only edition • New public registrations are disabled.',
-                      style: TextStyle(fontSize: 12, color: Colors.black54)),
-                  ),'''
-
-          new = '''                  const SizedBox(height: 8),
-                  OutlinedButton(
-                    onPressed: busy ? null : () => setState(() {
-                      signup = !signup;
-                      message = null;
-                      password.clear();
-                      confirm.clear();
-                    }),
-                    child: Text(signup
-                        ? 'Already registered? Login / لاگ اِن'
-                        : 'New user? Sign Up / نیا اکاؤنٹ بنائیں'),
-                  ),
-                  const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text(
-                      'Email verification is required. Account permissions depend on server approval.',
-                      style: TextStyle(fontSize: 12, color: Colors.black54),
-                    ),
-                  ),'''
-
-          if 'New user? Sign Up / نیا اکاؤنٹ بنائیں' in source:
-              print('Sign Up switch already exists; no changes necessary')
+          button = 'New user? Sign Up / نیا اکاؤنٹ بنائیں'
+          if button in source:
+              print('Sign Up button already exists. No changes needed.')
           else:
-              if source.count(old) != 1:
-                  raise SystemExit('Expected login label not found exactly once; no changes made')
-              fixed = source.replace(old, new, 1)
-              if 'signup = !signup' not in fixed or 'New public registrations are disabled.' in fixed:
-                  raise SystemExit('Patch verification failed')
+              anchor = "                  if (!signup)\n                    TextButton("
+              old_note = 'Personal owner-only edition • New public registrations are disabled.'
+              if source.count(anchor) != 1 or source.count(old_note) != 1:
+                  raise SystemExit('Unique login section not found; no changes made.')
+
+              addition = """                  OutlinedButton(
+                              onPressed: busy ? null : () => setState(() {
+                                signup = !signup;
+                                message = null;
+                                password.clear();
+                                confirm.clear();
+                              }),
+                              child: Text(
+                                signup
+                                    ? 'Already registered? Login / لاگ اِن'
+                                    : 'New user? Sign Up / نیا اکاؤنٹ بنائیں',
+                              ),
+                            ),
+          """
+              fixed = source.replace(anchor, addition + anchor, 1)
+              fixed = fixed.replace(
+                  old_note,
+                  'New accounts require email verification and server-side approval. Financial access is not automatic.',
+                  1,
+              )
+              if button not in fixed or old_note in fixed:
+                  raise SystemExit('Verification failed. No changes made.')
+
               path.write_text(fixed, encoding='utf-8')
-              print('Sign Up switch added safely')
+              print('Sign Up button successfully added.')
           PY
 
       - name: Commit fix
         shell: bash
         run: |
           if git diff --quiet -- lib/auth_entry.dart; then
-            echo 'No changes required.'
+            echo "No changes required."
           else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add lib/auth_entry.dart
-            git commit -m "Add Sign Up and Login switch to Sarmaya Plus"
+            git commit -m "Add Sign Up button to Sarmaya Plus"
             git push origin HEAD:main
           fi
