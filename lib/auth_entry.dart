@@ -314,8 +314,21 @@ class _AccountPageState extends State<AccountPage> {
                   ),
                   const Padding(
                     padding: EdgeInsets.symmetric(vertical: 8),
-                    child: Text('Personal owner-only edition • New public registrations are disabled.',
+                    child: Text('New accounts require email verification and server-side approval. Financial access is not automatic.',
                       style: TextStyle(fontSize: 12, color: Colors.black54)),
+                  ),
+                  OutlinedButton(
+                    onPressed: busy ? null : () => setState(() {
+                      signup = !signup;
+                      message = null;
+                      password.clear();
+                      confirm.clear();
+                    }),
+                    child: Text(
+                      signup
+                          ? 'Already registered? Login / لاگ اِن'
+                          : 'New user? Sign Up / نیا اکاؤنٹ بنائیں',
+                    ),
                   ),
                   if (!signup)
                     TextButton(
