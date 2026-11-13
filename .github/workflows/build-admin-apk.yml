@@ -1,0 +1,162 @@
+name: Build Sarmaya Plus Admin APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-admin-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout existing Sarmaya Plus source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Flutter source and artwork
+        run: |
+          set -euo pipefail
+          mkdir -p lib assets
+          cp sarmaya_icon.png assets/sarmaya_icon.png
+          test -f lib/admin_entry.dart
+          test -f lib/auth_entry.dart
+          test -f lib/remittance_v10.dart
+          test -f lib/v11_features.dart
+
+      - name: Generate separate Admin Android app
+        run: |
+          set -euo pipefail
+          flutter create --platforms=android --project-name=sarmaya_plus_admin --org=pk.sarmayaplus .
+          grep -q 'pk.sarmayaplus.sarmaya_plus_admin' android/app/build.gradle.kts
+
+      - name: Configure Admin Firebase app
+        env:
+          ADMIN_FIREBASE_JSON: ${{ secrets.SARMAYA_ADMIN_FIREBASE_JSON }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          raw = os.environ.get('ADMIN_FIREBASE_JSON', '')
+          if not raw:
+              raise RuntimeError('Missing SARMAYA_ADMIN_FIREBASE_JSON secret. Register the new Android app under the EXISTING Firebase project first.')
+          conf = json.loads(raw)
+          expected = 'pk.sarmayaplus.sarmaya_plus_admin'
+          project = conf['project_info']
+          if project['project_id'] != 'sarmaya-plus':
+              raise RuntimeError('Admin Firebase config must belong to the SAME Firebase project as Customer.')
+          client = next((c for c in conf['client']
+              if c['client_info']['android_client_info']['package_name'] == expected), None)
+          if client is None:
+              raise RuntimeError('Firebase Android app package mismatch: ' + expected)
+          options = [
+              "import 'package:firebase_core/firebase_core.dart';",
+              "import 'package:flutter/foundation.dart' show defaultTargetPlatform, TargetPlatform, kIsWeb;",
+              '',
+              'class DefaultFirebaseOptions {',
+              '  static FirebaseOptions get currentPlatform {',
+              '    if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) return android;',
+              "    throw UnsupportedError('Admin app supports Android only');",
+              '  }',
+              '  static const FirebaseOptions android = FirebaseOptions(',
+              '    apiKey: ' + json.dumps(client['api_key'][0]['current_key']) + ',',
+              '    appId: ' + json.dumps(client['client_info']['mobilesdk_app_id']) + ',',
+              '    messagingSenderId: ' + json.dumps(project['project_number']) + ',',
+              '    projectId: ' + json.dumps(project['project_id']) + ',',
+              '    storageBucket: ' + json.dumps(project.get('storage_bucket', '')) + ',',
+              '  );',
+              '}',
+              '',
+          ]
+          Path('lib/firebase_options.dart').write_text('\n'.join(options), encoding='utf-8')
+          Path('android/app/google-services.json').write_text(json.dumps(conf), encoding='utf-8')
+
+          settings = Path('android/settings.gradle.kts')
+          app = Path('android/app/build.gradle.kts')
+          st = settings.read_text(encoding='utf-8')
+          at = app.read_text(encoding='utf-8')
+          needle = 'id("com.android.application")'
+          if needle not in st or needle not in at:
+              raise RuntimeError('Gradle template changed; review Firebase configuration')
+          st = st.replace(needle,
+              'id("com.google.gms.google-services") version "4.4.4" apply false\n    ' + needle, 1)
+          at = at.replace(needle, needle + '\n    id("com.google.gms.google-services")', 1)
+          at = at.replace('minSdk = flutter.minSdkVersion', 'minSdk = 24')
+          settings.write_text(st, encoding='utf-8')
+          app.write_text(at, encoding='utf-8')
+          print('Admin Firebase configured; no secrets printed')
+          PY
+
+      - name: Configure existing Android release signing key
+        env:
+          SIGNING_BUNDLE: ${{ secrets.SARMAYA_ANDROID_SIGNING }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, re
+          from pathlib import Path
+          secret = os.environ.get('SIGNING_BUNDLE', '')
+          if not secret:
+              raise RuntimeError('Existing SARMAYA_ANDROID_SIGNING secret is required')
+          config = json.loads(base64.b64decode(secret, validate=True))
+          keystore = base64.b64decode(config['keystore'], validate=True)
+          password = config['password']
+          if len(keystore) < 1000 or not isinstance(password, str) or len(password) < 16:
+              raise RuntimeError('Invalid Android signing config')
+          Path('android/app/release.jks').write_bytes(keystore)
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write('SARMAYA_ANDROID_KEYSTORE_PASSWORD=' + password + '\n')
+          gradle = Path('android/app/build.gradle.kts')
+          source = gradle.read_text(encoding='utf-8')
+          if '    buildTypes {' not in source or 'signingConfig = signingConfigs.getByName("debug")' not in source:
+              raise RuntimeError('Unexpected Flutter Gradle template; review signing setup')
+          signing = '''    signingConfigs {
+              create("sarmayaRelease") {
+                  storeFile = file("release.jks")
+                  storePassword = System.getenv("SARMAYA_ANDROID_KEYSTORE_PASSWORD")
+                  keyAlias = "sarmayaplus"
+                  keyPassword = System.getenv("SARMAYA_ANDROID_KEYSTORE_PASSWORD")
+              }
+          }
+
+          '''
+          source = source.replace('    buildTypes {', signing + '    buildTypes {', 1)
+          source = source.replace('signingConfig = signingConfigs.getByName("debug")',
+              'signingConfig = signingConfigs.getByName("sarmayaRelease")', 1)
+          gradle.write_text(source, encoding='utf-8')
+          manifest = Path('android/app/src/main/AndroidManifest.xml')
+          xml = manifest.read_text(encoding='utf-8')
+          if 'android.permission.INTERNET' not in xml:
+              match = re.search(r'<manifest\b[^>]*>', xml, re.DOTALL)
+              if not match:
+                  raise RuntimeError('Missing AndroidManifest root')
+              xml = xml[:match.end()] + '\n    <uses-permission android:name="android.permission.INTERNET" />' + xml[match.end():]
+          xml = xml.replace('android:label="sarmaya_plus_admin"', 'android:label="Sarmaya Plus Admin"')
+          manifest.write_text(xml, encoding='utf-8')
+          print('Signed Admin build configured; no signing values printed')
+          PY
+
+      - name: Install Flutter dependencies
+        run: flutter pub get
+
+      - name: Compile independent Admin APK
+        run: flutter build apk --release --target-platform android-arm64 -t lib/admin_entry.dart --build-number ${{ github.run_number }}
+
+      - name: Upload Admin APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sarmaya-Plus-Admin-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
